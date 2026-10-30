@@ -55,15 +55,38 @@ def company_from_html(html, domain):
 def extract_contacts(html, base):
     soup = BeautifulSoup(html, "html.parser")
     emails, phones, socials, pages = set(), set(), set(), set()
+    base_host = urlparse(base).netloc
+
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         low = href.lower()
+
         if low.startswith("mailto:"):
             emails.add(href[7:].split("?")[0].strip().lower())
-        elif low.startswith("tel:"):
+            continue
+
+        if low.startswith("tel:"):
             phones.add(href[4:].strip())
-        else:
-            full = urljoin(base, href)
-            if any(s in full.lower() for s in SOCIALS):
-                socials.add(full.split("?")[0])
-            elif
+            continue
+
+        full = urljoin(base, href)
+        full_low = full.lower()
+
+        if any(s in full_low for s in SOCIALS):
+            socials.add(full.split("?")[0])
+            continue
+
+        same_site = urlparse(full).netloc == base_host
+        has_key = any(k in full_low for k in KEYS)
+        if same_site and has_key:
+            pages.add(full.split("#")[0])
+
+    text = soup.get_text(" ")
+    for e in EMAIL_RE.findall(text):
+        emails.add(e.lower())
+    for p in PHONE_RE.findall(text):
+        if 10 <= len(re.sub(r"\D", "", p)) <= 15:
+            phones.add(p.strip())
+
+    emails = {e for e in emails if not e.endswith(BAD_END) and "example" not in e and "sentry" not in e}
+    return emails, phones, socials, pages
