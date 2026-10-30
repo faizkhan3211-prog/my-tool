@@ -181,3 +181,78 @@ def show_results():
     st.markdown("### Decision-makers / People")
     if res["people"]:
         pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
+        st.dataframe(pdf, use_container_width=True)
+        st.download_button("Download People CSV", pdf.to_csv(index=False), "people.csv", key="dl_people")
+    else:
+        st.warning("Koi naam + title nahi mila. Company ka naam likh kar dobara try karo.")
+
+    st.markdown("### Company contacts")
+    if res["contacts"]:
+        cdf = pd.DataFrame(res["contacts"]).drop_duplicates(subset=["Website", "Type", "Value"])
+        st.dataframe(cdf, use_container_width=True)
+        st.download_button("Download Contacts CSV", cdf.to_csv(index=False), "contacts.csv", key="dl_contacts")
+    else:
+        st.info("Public contact nahi mila.")
+
+    if res["failed"]:
+        st.error("Ye websites khul nahi sakin: " + ", ".join(res["failed"]))
+
+
+def run_batch(items):
+    items = items[:MAX_BULK]
+    people, contacts, failed = [], [], []
+    bar = st.progress(0.0)
+    status = st.empty()
+    for i, (url, comp) in enumerate(items):
+        status.write(f"{i + 1}/{len(items)}: {url}")
+        try:
+            out = process_site(url, comp)
+        except Exception:
+            out = None
+        if out:
+            people += out["people"]
+            contacts += out["contacts"]
+        else:
+            failed.append(url)
+        bar.progress((i + 1) / len(items))
+    status.write("Mukammal!")
+    st.session_state["res"] = {"people": people, "contacts": contacts, "failed": failed}
+
+
+tab1, tab2 = st.tabs(["Single website", "Bulk mode"])
+
+with tab1:
+    c1, c2 = st.columns(2)
+    url_input = c1.text_input("Website ka link", placeholder="example.com")
+    company_input = c2.text_input("Company ka naam (optional, accuracy behtar hoti hai)")
+    if st.button("Dhoondo", key="single_btn") and url_input:
+        with st.spinner("Website aur search check ho rahi hai..."):
+            run_batch([(url_input, company_input)])
+
+with tab2:
+    st.write(f"Har line mein ek website. Company ka naam dena ho to comma lagao: `example.com, Example Corp`. Max {MAX_BULK} websites ek dafa mein.")
+    text = st.text_area("Websites ki list", height=180, placeholder="example.com\nanother.com, Another Corp")
+    up = st.file_uploader("Ya CSV upload karo", type="csv")
+
+    items = []
+    for line in text.splitlines():
+        if line.strip():
+            parts = [x.strip() for x in line.split(",", 1)]
+            items.append((parts[0], parts[1] if len(parts) > 1 else ""))
+
+    if up is not None:
+        df_in = pd.read_csv(up)
+        wcol = st.selectbox("Website wala column", df_in.columns)
+        ccol = st.selectbox("Company naam wala column (optional)", ["(none)"] + list(df_in.columns))
+        for _, r in df_in.iterrows():
+            w = str(r[wcol]).strip()
+            if w and w.lower() != "nan":
+                comp = "" if ccol == "(none)" else str(r[ccol]).replace("nan", "").strip()
+                items.append((w, comp))
+
+    if items:
+        st.info(f"{len(items)} websites mili. Is dafa {min(len(items), MAX_BULK)} check hongi.")
+    if st.button("Bulk start karo", key="bulk_btn") and items:
+        run_batch(items)
+
+show_results()
