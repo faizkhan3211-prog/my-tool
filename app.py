@@ -1,4 +1,5 @@
 import re
+import time
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -15,6 +16,7 @@ st.set_page_config(page_title="Decision-Maker Finder", layout="wide")
 st.title("Decision-Maker & Contact Finder")
 st.caption("Built by Faiz Khan")
 
+MAX_BULK = 25
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{7,18}\d")
@@ -91,53 +93,91 @@ def extract_contacts(html, base):
     emails = {e for e in emails if not e.endswith(BAD_END) and "example" not in e and "sentry" not in e}
     return emails, phones, socials, pages
 
-col1, col2 = st.columns(2)
-url_input = col1.text_input("Website ka link", placeholder="example.com")
-company_input = col2.text_input("Company ka naam (optional, accuracy behtar hoti hai)")
 
-if st.button("Dhoondo") and url_input:
-    base = normalize(url_input)
+def extract_people(html, src):
+    soup = BeautifulSoup(html, "html.parser")
+    lines = [l.strip() for l in soup.get_text("\n").split("\n") if l.strip()]
+    found = []
+    for i, line in enumerate(lines):
+        if len(line) < 70 and TITLE_RE.search(line) and not NAME_RE.match(line):
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(lines) and NAME_RE.match(lines[j]):
+                    found.append({"Name": lines[j], "Title": line, "Source": "Website", "Link": src})
+                    break
+    return found
+
+
+def search_people(company, domain, limit=10):
+    if DDGS is None:
+        return []
+    queries = [
+        f'site:linkedin.com/in "{company}" (CEO OR Founder OR Owner OR President)',
+        f'site:linkedin.com/in "{company}" (Director OR Manager OR Head OR VP)',
+        f'"{company}" {domain} leadership team CEO founder',
+    ]
+    out = []
+    for q in queries:
+        try:
+            results = DDGS().text(q, max_results=limit)
+        except Exception:
+            continue
+        for r in results or []:
+            href, title, body = r.get("href", ""), r.get("title", ""), r.get("body", "")
+            if "linkedin.com/in" not in href:
+                continue
+            blob = (title + " " + body).lower()
+            if company.lower().split()[0] not in blob:
+                continue
+            t = title.replace("| LinkedIn", "").strip()
+            parts = [x.strip() for x in re.split(r" - | – | \| ", t) if x.strip()]
+            if len(parts) >= 2 and NAME_RE.match(parts[0]):
+                out.append({"Name": parts[0], "Title": parts[1], "Source": "Web search", "Link": href})
+        time.sleep(1)
+    return out
+
+
+def process_site(url, company_hint=""):
+    base = normalize(url)
     domain = urlparse(base).netloc
-    with st.spinner("Website aur search check ho rahi hai..."):
-        html = fetch(base)
-        if not html:
-            st.error("Website khul nahi saki ya block hai. Link check karo.")
-            st.stop()
+    html = fetch(base)
+    if not html:
+        return None
 
-        company = company_input.strip() or company_from_html(html, domain)
-        e, p, s, pages = extract_contacts(html, base)
-        contacts = [(base, e, p, s)]
-        people = extract_people(html, base)
+    company = company_hint.strip() or company_from_html(html, domain)
+    e, p, s, pages = extract_contacts(html, base)
+    contacts = [(base, e, p, s)]
+    people = extract_people(html, base)
 
-        for pg in list(pages)[:6]:
-            h = fetch(pg)
-            if h:
-                e2, p2, s2, _ = extract_contacts(h, pg)
-                contacts.append((pg, e2, p2, s2))
-                people += extract_people(h, pg)
+    for pg in list(pages)[:6]:
+        h = fetch(pg)
+        if h:
+            e2, p2, s2, _ = extract_contacts(h, pg)
+            contacts.append((pg, e2, p2, s2))
+            people += extract_people(h, pg)
 
-        people += search_people(company, domain)
+    people += search_people(company, domain)
 
-    st.subheader(f"Company: {company}")
+    people_rows = []
+    for x in people:
+        row = {"Company": company, "Website": domain}
+        row.update(x)
+        people_rows.append(row)
+
+    contact_rows, soc = [], set()
+    for src, ems, phs, scs in contacts:
+        contact_rows += [{"Company": company, "Website": domain, "Type": "Email", "Value": v, "Found on": src} for v in ems]
+        contact_rows += [{"Company": company, "Website": domain, "Type": "Phone", "Value": v, "Found on": src} for v in phs]
+        soc |= scs
+    contact_rows += [{"Company": company, "Website": domain, "Type": "Social", "Value": v, "Found on": base} for v in sorted(soc)]
+
+    return {"people": people_rows, "contacts": contact_rows}
+
+
+def show_results():
+    res = st.session_state.get("res")
+    if not res:
+        return
 
     st.markdown("### Decision-makers / People")
-    if people:
-        pdf = pd.DataFrame(people).drop_duplicates(subset=["Name"])
-        st.dataframe(pdf, use_container_width=True)
-        st.download_button("Download People CSV", pdf.to_csv(index=False), "people.csv")
-    else:
-        st.warning("Koi naam + title nahi mila. Company ka naam upar likh kar dobara try karo.")
-
-    st.markdown("### Company contacts")
-    rows, soc = [], set()
-    for src, ems, phs, scs in contacts:
-        rows += [{"Type": "Email", "Value": x, "Found on": src} for x in ems]
-        rows += [{"Type": "Phone", "Value": x, "Found on": src} for x in phs]
-        soc |= scs
-    rows += [{"Type": "Social", "Value": x, "Found on": base} for x in sorted(soc)]
-    if rows:
-        cdf = pd.DataFrame(rows).drop_duplicates(subset=["Type", "Value"])
-        st.dataframe(cdf, use_container_width=True)
-        st.download_button("Download Contacts CSV", cdf.to_csv(index=False), "contacts.csv")
-    else:
-        st.info("Website par koi public contact nahi mila.")
+    if res["people"]:
+        pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
