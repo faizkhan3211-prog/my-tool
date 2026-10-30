@@ -1,5 +1,7 @@
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -16,13 +18,24 @@ st.set_page_config(page_title="Decision-Maker Finder", layout="wide")
 st.title("Decision-Maker & Contact Finder")
 st.caption("Built by Faiz Khan")
 
-MAX_BULK = 25
+MAX_BULK = 300
+WORKERS = 4
+SEARCH_LOCK = threading.Lock()
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{7,18}\d")
 NAME_RE = re.compile(r"^[A-Z][a-zA-Z'’-]+(?: [A-Z]\.?)?(?: [A-Z][a-zA-Z'’-]+){1,2}$")
 BAD_END = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
-SOCIALS = ["linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com"]
+SOCIAL_NAMES = {
+    "linkedin.com": "LinkedIn",
+    "facebook.com": "Facebook",
+    "twitter.com": "Twitter/X",
+    "x.com": "Twitter/X",
+    "instagram.com": "Instagram",
+    "youtube.com": "YouTube",
+}
+SHARE_WORDS = ("share", "sharer", "intent", "dialog", "login", "plugins")
 KEYS = ["contact", "about", "team", "leadership", "management", "people", "staff"]
 TITLES = ["CEO", "Founder", "Co-Founder", "Owner", "President", "Chairman", "Director",
           "Manager", "VP", "Vice President", "Head", "Chief", "Partner", "Principal",
@@ -42,6 +55,17 @@ def fetch(url):
             return r.text
     except Exception:
         pass
+    return None
+
+
+def social_platform(url):
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    low = url.lower()
+    if any(w in low for w in SHARE_WORDS):
+        return None
+    for dom, name in SOCIAL_NAMES.items():
+        if host == dom or host.endswith("." + dom):
+            return name
     return None
 
 
@@ -72,14 +96,13 @@ def extract_contacts(html, base):
             continue
 
         full = urljoin(base, href)
-        full_low = full.lower()
 
-        if any(s in full_low for s in SOCIALS):
-            socials.add(full.split("?")[0])
+        if social_platform(full):
+            socials.add(full.split("?")[0].rstrip("/"))
             continue
 
         same_site = urlparse(full).netloc == base_host
-        has_key = any(k in full_low for k in KEYS)
+        has_key = any(k in full.lower() for k in KEYS)
         if same_site and has_key:
             pages.add(full.split("#")[0])
 
@@ -116,29 +139,30 @@ def search_people(company, domain, limit=10):
         f'"{company}" {domain} leadership team CEO founder',
     ]
     out = []
-    for q in queries:
-        try:
-            results = DDGS().text(q, max_results=limit)
-        except Exception:
-            continue
-        for r in results or []:
-            href, title, body = r.get("href", ""), r.get("title", ""), r.get("body", "")
-            if "linkedin.com/in" not in href:
-                continue
-            blob = (title + " " + body).lower()
-            if company.lower().split()[0] not in blob:
-                continue
-            t = title.replace("| LinkedIn", "").strip()
-            parts = [x.strip() for x in re.split(r" - | – | \| ", t) if x.strip()]
-            if len(parts) >= 2 and NAME_RE.match(parts[0]):
-                out.append({"Name": parts[0], "Title": parts[1], "Source": "Web search", "Link": href})
-        time.sleep(1)
+    with SEARCH_LOCK:
+        for q in queries:
+            try:
+                results = DDGS().text(q, max_results=limit)
+            except Exception:
+                results = []
+            for r in results or []:
+                href, title, body = r.get("href", ""), r.get("title", ""), r.get("body", "")
+                if "linkedin.com/in" not in href:
+                    continue
+                blob = (title + " " + body).lower()
+                if company.lower().split()[0] not in blob:
+                    continue
+                t = title.replace("| LinkedIn", "").strip()
+                parts = [x.strip() for x in re.split(r" - | – | \| ", t) if x.strip()]
+                if len(parts) >= 2 and NAME_RE.match(parts[0]):
+                    out.append({"Name": parts[0], "Title": parts[1], "Source": "Web search", "Link": href})
+            time.sleep(1)
     return out
 
 
-def process_site(url, company_hint=""):
+def process_site(url, company_hint, use_search):
     base = normalize(url)
-    domain = urlparse(base).netloc
+    domain = urlparse(base).netloc.replace("www.", "")
     html = fetch(base)
     if not html:
         return None
@@ -155,68 +179,83 @@ def process_site(url, company_hint=""):
             contacts.append((pg, e2, p2, s2))
             people += extract_people(h, pg)
 
-    people += search_people(company, domain)
+    if use_search:
+        people += search_people(company, domain)
 
-    people_rows = []
-    for x in people:
-        row = {"Company": company, "Website": domain}
-        row.update(x)
-        people_rows.append(row)
-
-    contact_rows, soc = [], set()
+    base_cols = {"Company": company, "Website": domain}
+    people_rows = [dict(base_cols, **x) for x in people]
+    email_rows, phone_rows, social_rows = [], [], []
     for src, ems, phs, scs in contacts:
-        contact_rows += [{"Company": company, "Website": domain, "Type": "Email", "Value": v, "Found on": src} for v in ems]
-        contact_rows += [{"Company": company, "Website": domain, "Type": "Phone", "Value": v, "Found on": src} for v in phs]
-        soc |= scs
-    contact_rows += [{"Company": company, "Website": domain, "Type": "Social", "Value": v, "Found on": base} for v in sorted(soc)]
+        email_rows += [dict(base_cols, Email=v, **{"Found on": src}) for v in sorted(ems)]
+        phone_rows += [dict(base_cols, Phone=v, **{"Found on": src}) for v in sorted(phs)]
+        social_rows += [dict(base_cols, Platform=social_platform(v), Link=v) for v in sorted(scs)]
 
-    return {"people": people_rows, "contacts": contact_rows}
+    return {"people": people_rows, "emails": email_rows, "phones": phone_rows, "socials": social_rows}
+
+
+def safe_process(url, comp, use_search):
+    try:
+        return process_site(url, comp, use_search)
+    except Exception:
+        return None
+
+
+def run_batch(items, use_search):
+    seen, unique = set(), []
+    for url, comp in items:
+        key = urlparse(normalize(url)).netloc.replace("www.", "")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append((url, comp))
+    unique = unique[:MAX_BULK]
+
+    res = {"people": [], "emails": [], "phones": [], "socials": [], "failed": []}
+    bar = st.progress(0.0)
+    status = st.empty()
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(safe_process, u, c, use_search): u for u, c in unique}
+        for f in as_completed(futures):
+            out = f.result()
+            if out:
+                for k in ("people", "emails", "phones", "socials"):
+                    res[k] += out[k]
+            else:
+                res["failed"].append(futures[f])
+            done += 1
+            bar.progress(done / len(unique))
+            status.write(f"{done}/{len(unique)} mukammal")
+    status.write(f"Mukammal! {len(unique)} websites check hui.")
+    st.session_state["res"] = res
+
+
+def table(rows, subset, label, fname, key, empty_msg):
+    if rows:
+        df = pd.DataFrame(rows).drop_duplicates(subset=subset)
+        st.write(f"**{len(df)} {label}**")
+        st.dataframe(df, use_container_width=True)
+        st.download_button(f"Download {label} CSV", df.to_csv(index=False), fname, key=key)
+    else:
+        st.info(empty_msg)
 
 
 def show_results():
     res = st.session_state.get("res")
     if not res:
         return
-
-    st.markdown("### Decision-makers / People")
-    if res["people"]:
-        pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
-        st.dataframe(pdf, use_container_width=True)
-        st.download_button("Download People CSV", pdf.to_csv(index=False), "people.csv", key="dl_people")
-    else:
-        st.warning("Koi naam + title nahi mila. Company ka naam likh kar dobara try karo.")
-
-    st.markdown("### Company contacts")
-    if res["contacts"]:
-        cdf = pd.DataFrame(res["contacts"]).drop_duplicates(subset=["Website", "Type", "Value"])
-        st.dataframe(cdf, use_container_width=True)
-        st.download_button("Download Contacts CSV", cdf.to_csv(index=False), "contacts.csv", key="dl_contacts")
-    else:
-        st.info("Public contact nahi mila.")
-
+    t1, t2, t3, t4 = st.tabs(["People (naam + title)", "Emails", "Phones", "Social profiles"])
+    with t1:
+        table(res["people"], ["Website", "Name"], "people", "people.csv", "dl_p",
+              "Koi naam + title nahi mila. Company ka naam likh kar dobara try karo.")
+    with t2:
+        table(res["emails"], ["Website", "Email"], "emails", "emails.csv", "dl_e", "Koi email nahi mili.")
+    with t3:
+        table(res["phones"], ["Website", "Phone"], "phones", "phones.csv", "dl_ph", "Koi phone nahi mila.")
+    with t4:
+        table(res["socials"], ["Website", "Link"], "social profiles", "social_profiles.csv", "dl_s",
+              "Koi social profile nahi mila.")
     if res["failed"]:
         st.error("Ye websites khul nahi sakin: " + ", ".join(res["failed"]))
-
-
-def run_batch(items):
-    items = items[:MAX_BULK]
-    people, contacts, failed = [], [], []
-    bar = st.progress(0.0)
-    status = st.empty()
-    for i, (url, comp) in enumerate(items):
-        status.write(f"{i + 1}/{len(items)}: {url}")
-        try:
-            out = process_site(url, comp)
-        except Exception:
-            out = None
-        if out:
-            people += out["people"]
-            contacts += out["contacts"]
-        else:
-            failed.append(url)
-        bar.progress((i + 1) / len(items))
-    status.write("Mukammal!")
-    st.session_state["res"] = {"people": people, "contacts": contacts, "failed": failed}
 
 
 tab1, tab2 = st.tabs(["Single website", "Bulk mode"])
@@ -227,10 +266,11 @@ with tab1:
     company_input = c2.text_input("Company ka naam (optional, accuracy behtar hoti hai)")
     if st.button("Dhoondo", key="single_btn") and url_input:
         with st.spinner("Website aur search check ho rahi hai..."):
-            run_batch([(url_input, company_input)])
+            run_batch([(url_input, company_input)], True)
 
 with tab2:
     st.write(f"Har line mein ek website. Company ka naam dena ho to comma lagao: `example.com, Example Corp`. Max {MAX_BULK} websites ek dafa mein.")
+    use_search = st.checkbox("Web search se log (naam + title) bhi dhoondo (slow, lekin zyada people milte hain)", value=True)
     text = st.text_area("Websites ki list", height=180, placeholder="example.com\nanother.com, Another Corp")
     up = st.file_uploader("Ya CSV upload karo", type="csv")
 
@@ -253,6 +293,6 @@ with tab2:
     if items:
         st.info(f"{len(items)} websites mili. Is dafa {min(len(items), MAX_BULK)} check hongi.")
     if st.button("Bulk start karo", key="bulk_btn") and items:
-        run_batch(items)
+        run_batch(items, use_search)
 
 show_results()
