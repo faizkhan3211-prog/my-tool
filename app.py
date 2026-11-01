@@ -572,7 +572,37 @@ def read_sites_csv(up):
         return df0, False
     up.seek(0)
     return pd.read_csv(up, dtype=str), True
+def get_secret(name, default=""):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return default
 
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def ai_parse(desc, api_key, model):
+    prompt = (
+        "Extract lead-search settings from this client description. "
+        "Reply with ONLY JSON in this shape: "
+        '{"queries": ["up to 5 web search queries that find company websites"], '
+        '"emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
+        "Use 0 when not mentioned. Revenue is in millions of USD.\n\nDescription: " + desc
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    try:
+        r = requests.post(
+            url,
+            headers={"x-goog-api-key": api_key},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json"},
+            },
+            timeout=30,
+        )
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except Exception:
+        return None
 
 # ---------- UI ----------
 tab_single, tab_bulk, tab_search = st.tabs(["Single website", "Bulk mode", "Client description search"])
@@ -644,7 +674,18 @@ with tab_search:
             d_emp_min, d_emp_max = man_emp_min, man_emp_max
         if man_rev_min or man_rev_max:
             d_rev_min, d_rev_max = man_rev_min, man_rev_max
-        q_clean = clean_description(desc)
+        q_clean = clean_description(desc)        ai = None
+        if get_secret("GEMINI_API_KEY") and get_secret("GEMINI_MODEL"):
+            ai = ai_parse(desc, get_secret("GEMINI_API_KEY"), get_secret("GEMINI_MODEL"))
+        if ai:
+            ai_queries = [str(q) for q in ai.get("queries", [])][:5]
+            if not (man_emp_min or man_emp_max):
+                d_emp_min = int(ai.get("emp_min", 0) or 0)
+                d_emp_max = int(ai.get("emp_max", 0) or 0)
+            if not (man_rev_min or man_rev_max):
+                d_rev_min = float(ai.get("rev_min_m", 0) or 0)
+                d_rev_max = float(ai.get("rev_max_m", 0) or 0)
+            st.success("AI ne description samjhi. Queries: " + " | ".join(ai_queries))
         st.caption(f"Search query: **{q_clean}** | Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}")
 
     if st.button("Dhoondo", key="search_btn") and desc.strip():
@@ -662,7 +703,8 @@ with tab_search:
         queries = []
         for q in (base_q, f"best {base_q}", f"top {base_q}", f"{base_q} contact us", f"{base_q} services"):
             if q not in queries:
-                queries.append(q)
+                queries.append(q)        if ai_queries:
+            queries = ai_queries + queries
         found = discover(queries)
         domains = list(found.keys())[:max_cand]
         if not domains:
