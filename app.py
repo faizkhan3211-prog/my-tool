@@ -1,9 +1,11 @@
 import json
+import math
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+from functools import lru_cache
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -16,23 +18,31 @@ try:
 except Exception:
     DDGS = None
 
+try:
+    import dns.resolver as dns_resolver
+except Exception:
+    dns_resolver = None
+
 st.set_page_config(page_title="Decision-Maker Finder", layout="wide")
 st.title("Decision-Maker & Contact Finder")
 st.caption("Built by Faiz Khan")
 
-MAX_BULK = 300
-WORKERS = 4
+WORKERS = 8
+HARD_CAP = 3000
+DISCOVER_SECONDS = 900
 SEARCH_LOCK = threading.Lock()
-
-WANT_ALL = ["Company profile", "People", "Emails", "Phones", "Social profiles"]
-PLAT_ALL = ["LinkedIn", "Facebook", "Instagram", "Twitter/X", "YouTube"]
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+EMAIL_FULL = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)+$")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{7,18}\d")
 NAME_RE = re.compile(r"^[A-Z][a-zA-Z'’-]+(?: [A-Z]\.?)?(?: [A-Z][a-zA-Z'’-]+){1,2}$")
 ADDRESS_RE = re.compile(r"\d{1,6}\s[A-Za-z0-9 .,'#-]{5,80}?,?\s[A-Z]{2}\s\d{5}(?:-\d{4})?")
-BAD_END = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
+BAD_END = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js", ".woff", ".ico")
+JUNK_EMAIL_DOMAIN = ("example.", "sentry", "wixpress", "domain.com", "yourdomain", "email.com",
+                     "test.com", "godaddy", "squarespace", "wordpress", "schema.org", "w3.org")
+JUNK_EMAIL_LOCAL = ("noreply", "no-reply", "donotreply", "do-not-reply", "you", "name", "user",
+                    "yourname", "email", "firstname", "lastname")
 SOCIAL_NAMES = {
     "linkedin.com": "LinkedIn",
     "facebook.com": "Facebook",
@@ -41,11 +51,16 @@ SOCIAL_NAMES = {
     "instagram.com": "Instagram",
     "youtube.com": "YouTube",
 }
+SOCIAL_COLS = ["LinkedIn", "Facebook", "Instagram", "Twitter/X", "YouTube"]
+BAD_SOCIAL_SEG = {"sharer", "sharer.php", "share", "share.php", "tr", "plugins", "dialog", "login",
+                  "intent", "home", "explore", "hashtag", "p", "reel", "reels", "watch", "privacy",
+                  "policy", "about", "help", "groups", "events", "photo", "photos",
+                  "permalink.php", "story.php", "profile.php"}
 SHARE_WORDS = ("share", "sharer", "intent", "dialog", "login", "plugins")
 KEYS = ["contact", "about", "team", "leadership", "management", "people", "staff"]
 TITLES = ["CEO", "Founder", "Co-Founder", "Owner", "President", "Chairman", "Director",
           "Manager", "VP", "Vice President", "Head", "Chief", "Partner", "Principal",
-          "Broker", "Managing", "COO", "CFO", "CTO", "CMO"]
+          "Broker", "Managing", "COO", "CFO", "CTO", "CMO", "Dentist", "Doctor", "Dr"]
 TITLE_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in TITLES) + r")\b", re.I)
 
 INFO_SITES = ["growjo.com", "zoominfo.com", "zippia.com", "dnb.com", "cortera.com",
@@ -58,7 +73,24 @@ BLOCK_DOMAINS = ["yelp.", "facebook.", "instagram.", "linkedin.", "tripadvisor."
                  "mindbodyonline.", "treatwell.", "thumbtack.", "expertise.", "cylex.", "chamberofcommerce.",
                  "superpages.", "foursquare.", "nextdoor.", "doctor.", "webmd.", "vogue.", "allure.",
                  "forbes.", "buzzfeed.", "medium.", "glassdoor.", "indeed.", "zippia.", "zoominfo.",
-                 "growjo.", "dnb.", "apollo.", "rocketreach.", "opencare.", "sharecare."]
+                 "growjo.", "dnb.", "apollo.", "rocketreach.", "opencare.", "sharecare.",
+                 "zillow.", "realtor.com", "redfin.", "trulia.", "apartments.com", "loopnet.", "crexi.",
+                 "homes.com", "1800dentist", "ada.org", "dentistry.com", "dentalplans", "dentist.com",
+                 "amazon.", "ebay.", "apple.", "microsoft.", "bloomberg.", "linktr.ee", "nerdwallet.",
+                 "usnews.", "healthline.", "mayoclinic.", "cdc.gov", "nih.gov", ".gov", ".edu",
+                 "angi.", "porch.", "houzz.", "clutch.co", "g2.com", "capterra.", "trustpilot.",
+                 "crunchbase.", "owler.", "yellowbook.", "alignable.", "merchantcircle.", "citysearch.",
+                 "dexknows.", "local.com", "hotfrog.", "brownbook.", "showmelocal.", "bizapedia."]
+
+US_STATES = ["Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut",
+             "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa",
+             "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan",
+             "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+             "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio",
+             "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+             "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington", "West Virginia",
+             "Wisconsin", "Wyoming"]
+US_NAMES = ("usa", "us", "u.s.", "u.s.a.", "united states", "united states of america", "america")
 
 UNIT = r"(?:billion|million|thousand|bn|mm|b|m|k)"
 MONEY_RE = re.compile(r"\$\s?(\d[\d,]*\.?\d*)\s*(billion|million|thousand|bn|mm|b|m|k)?\b", re.I)
@@ -90,6 +122,63 @@ def social_platform(url):
     for dom, name in SOCIAL_NAMES.items():
         if host == dom or host.endswith("." + dom):
             return name
+    return None
+
+
+def valid_social(url):
+    plat = social_platform(url)
+    if not plat:
+        return None
+    segs = [s for s in urlparse(url).path.split("/") if s]
+    if not segs:
+        return None
+    first = segs[0].lower()
+    if plat == "LinkedIn":
+        return plat if first in ("company", "in", "school") and len(segs) > 1 else None
+    if plat == "YouTube":
+        ok = (first in ("channel", "c", "user") and len(segs) > 1) or first.startswith("@")
+        return plat if ok else None
+    return plat if first not in BAD_SOCIAL_SEG else None
+
+
+@lru_cache(maxsize=8192)
+def mx_ok(domain):
+    if dns_resolver is None:
+        return True
+    try:
+        dns_resolver.resolve(domain, "MX", lifetime=4)
+        return True
+    except dns_resolver.NXDOMAIN:
+        return False
+    except dns_resolver.NoAnswer:
+        try:
+            dns_resolver.resolve(domain, "A", lifetime=4)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return True
+
+
+def valid_email(e):
+    e = e.strip().lower()
+    if not EMAIL_FULL.match(e) or e.endswith(BAD_END):
+        return False
+    local, dom = e.split("@", 1)
+    if any(j in dom for j in JUNK_EMAIL_DOMAIN) or local in JUNK_EMAIL_LOCAL:
+        return False
+    return mx_ok(dom)
+
+
+def norm_phone(raw):
+    raw = (raw or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits[0] == "1":
+        digits = digits[1:]
+    if len(digits) == 10 and digits[0] in "23456789" and digits[3] in "23456789":
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    if raw.startswith("+") and 11 <= len(digits) <= 15:
+        return "+" + digits
     return None
 
 
@@ -144,10 +233,7 @@ def extract_contacts(html, base):
     for e in EMAIL_RE.findall(text):
         emails.add(e.lower())
     for p in PHONE_RE.findall(text):
-        if 10 <= len(re.sub(r"\D", "", p)) <= 15:
-            phones.add(p.strip())
-
-    emails = {e for e in emails if not e.endswith(BAD_END) and "example" not in e and "sentry" not in e}
+        phones.add(p.strip())
     return emails, phones, socials, pages
 
 
@@ -215,7 +301,6 @@ def search_people(company, domain, limit=10):
     queries = [
         f'site:linkedin.com/in "{company}" (CEO OR Founder OR Owner OR President)',
         f'site:linkedin.com/in "{company}" (Director OR Manager OR Head OR VP)',
-        f'"{company}" {domain} leadership team CEO founder',
     ]
     out = []
     with SEARCH_LOCK:
@@ -356,10 +441,8 @@ def overlaps(lo, hi, min_v, max_v):
     return hi >= min_v and lo <= top
 
 
-def passes(info, emp_min, emp_max, rev_min, rev_max, drop_blank):
+def passes(info, emp_min, emp_max, rev_min, rev_max):
     emp, rev = info["emp"], info["rev"]
-    if drop_blank and not emp and not rev:
-        return False
     if emp_min or emp_max:
         if not emp or not overlaps(emp[0], emp[1], emp_min, emp_max):
             return False
@@ -369,7 +452,7 @@ def passes(info, emp_min, emp_max, rev_min, rev_max, drop_blank):
     return True
 
 
-# ---------- description search ----------
+# ---------- description understanding ----------
 def clean_description(desc):
     q = EMP_RANGE_RE.sub(" ", desc)
     q = EMP_ONE_RE.sub(" ", q)
@@ -392,6 +475,18 @@ def detect_filters(desc):
     return emp_min, emp_max, rev_min, rev_max
 
 
+def detect_count(desc):
+    m = re.search(r"\b(\d[\d,]*)\s*\+?\s*(?:companies|company|leads|records|results|businesses|contacts|websites)\b", desc, re.I)
+    if not m:
+        m = re.search(r"\b(?:need|want|get|give|find)\s+(?:me\s+)?(\d[\d,]*)\b", desc, re.I)
+    if m:
+        try:
+            return min(int(m.group(1).replace(",", "")), 10000)
+        except Exception:
+            return 0
+    return 0
+
+
 def get_secret(name, default=""):
     try:
         return str(st.secrets[name]).strip()
@@ -402,11 +497,14 @@ def get_secret(name, default=""):
 @st.cache_data(show_spinner=False, ttl=3600)
 def ai_parse(desc, api_key, models):
     prompt = (
-        "Extract lead-search settings from this client description. "
-        "Reply with ONLY JSON in this shape: "
-        '{"queries": ["up to 5 web search queries that find company websites"], '
-        '"emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
-        "Use 0 when not mentioned. Revenue is in millions of USD.\n\nDescription: " + desc
+        "Read this client's lead-generation request and reply with ONLY JSON in this shape: "
+        '{"niches": ["up to 6 short business-type phrases for web search, e.g. real estate agency, dental clinic"], '
+        '"locations": ["cities/states/regions mentioned; empty list if only a whole country"], '
+        '"country": "USA or other country name or empty", '
+        '"count": 0, "emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
+        "count = how many companies the client wants (0 if not stated). "
+        "Never invent employee or revenue numbers: use 0 unless the client explicitly states them. "
+        "Revenue is in millions of USD.\n\nRequest: " + desc
     )
     last = "koi model try nahi hua"
     for model in models:
@@ -431,14 +529,40 @@ def ai_parse(desc, api_key, models):
     return None, last
 
 
-def discover(queries, per_query=20):
+def build_queries(niches, locations, country, target):
+    niches = [n for n in niches if n] or [""]
+    locs = [l for l in locations if l]
+    is_us = country.strip().lower() in US_NAMES
+    first_locs = locs or ([country] if country else [""])
+    variants = ["{n} {l}", "best {n} {l}", "top {n} {l}", "{n} {l} contact us", "{n} {l} services", "local {n} {l}"]
+    queries = []
+    for v in variants:
+        for l in first_locs:
+            for n in niches:
+                queries.append(" ".join(v.format(n=n, l=l).split()))
+    if target and is_us and not locs:
+        for state in US_STATES:
+            for n in niches:
+                queries.append(f"{n} {state}")
+        for state in US_STATES:
+            for n in niches:
+                queries.append(f"best {n} in {state}")
+    return list(dict.fromkeys(queries))
+
+
+def discover(queries, target, status):
     found = {}
     if DDGS is None:
-        return found
+        return found, 0
+    start = time.time()
+    done = 0
+    goal = int(target * 1.6) if target else 0
     with SEARCH_LOCK:
         for q in queries:
+            if time.time() - start > DISCOVER_SECONDS:
+                break
             try:
-                results = DDGS().text(q, max_results=per_query)
+                results = DDGS().text(q, max_results=30)
             except Exception:
                 results = []
             for r in results or []:
@@ -446,8 +570,12 @@ def discover(queries, per_query=20):
                 if not host or any(b in host for b in BLOCK_DOMAINS):
                     continue
                 found.setdefault(host, "")
-            time.sleep(1)
-    return found
+            done += 1
+            status.write(f"Step 1: search {done}/{len(queries)} | companies ki websites mili: {len(found)}")
+            if goal and len(found) >= goal:
+                break
+            time.sleep(0.7)
+    return found, done
 
 
 def name_for_domain(domain):
@@ -459,7 +587,6 @@ def name_for_domain(domain):
 
 # ---------- per-site processing ----------
 def pick_email(emails, domain):
-    emails = sorted(emails)
     stem = domain.split(".")[0]
     own = [e for e in emails if stem in e.split("@")[-1]]
     pool = own or emails
@@ -470,137 +597,140 @@ def pick_email(emails, domain):
     return pool[0] if pool else ""
 
 
-def process_site(url, company_hint, use_search, opts):
-    want, plats = opts["want"], opts["plats"]
+def process_site(url, hint, use_search):
     base = normalize(url)
     domain = urlparse(base).netloc.replace("www.", "")
     html = fetch(base)
     if not html:
         return None
 
-    company = company_hint.strip() or company_from_html(html, domain)
+    company = hint.strip() or company_from_html(html, domain)
     e, p, s, pages = extract_contacts(html, base)
-    contacts = [(base, e, p, s)]
-    people = extract_people(html, base) if "People" in want else []
-    address, phone, desc = extract_profile(html)
+    pdata = [(e, p, s)]
+    people = extract_people(html, base)
+    address, tel, desc = extract_profile(html)
 
     for pg in list(pages)[:6]:
         h = fetch(pg)
         if h:
             e2, p2, s2, _ = extract_contacts(h, pg)
-            contacts.append((pg, e2, p2, s2))
-            if "People" in want:
-                people += extract_people(h, pg)
-            a2, ph2, d2 = extract_profile(h)
-            address, phone, desc = address or a2, phone or ph2, desc or d2
+            pdata.append((e2, p2, s2))
+            people += extract_people(h, pg)
+            a2, t2, d2 = extract_profile(h)
+            address, tel, desc = address or a2, tel or t2, desc or d2
 
-    if not phone:
-        for _, _, phs, _ in contacts:
-            if phs:
-                phone = sorted(phs)[0]
-                break
+    stem = domain.split(".")[0]
+    emails, phones, socials = [], [], {}
+    seen_e, seen_p = set(), set()
+    cand_phones = [tel] if tel else []
+    for e_, p_, s_ in pdata:
+        for x in sorted(e_):
+            if x not in seen_e and valid_email(x):
+                seen_e.add(x)
+                emails.append(x)
+        cand_phones += sorted(p_)
+        for x in sorted(s_):
+            plat = valid_social(x)
+            if plat and plat not in socials:
+                socials[plat] = x
+    for x in cand_phones:
+        n = norm_phone(x)
+        if n and n not in seen_p:
+            seen_p.add(n)
+            phones.append(n)
+    emails.sort(key=lambda m: stem not in m.split("@")[-1])
 
-    if use_search and "People" in want:
+    if use_search:
         people += search_people(company, domain)
+    uniq, seen_n = [], set()
+    for x in people:
+        k = x["Name"].lower()
+        if k not in seen_n:
+            seen_n.add(k)
+            uniq.append(x)
+    people = uniq
+
+    row = {
+        "Company": company,
+        "Website": domain,
+        "Address": address,
+        "Phone": phones[0] if phones else "",
+        "All phones": "; ".join(phones[:5]),
+        "General email": pick_email(emails, domain),
+        "All emails": "; ".join(emails[:8]),
+        "People (name - title)": "; ".join(f"{x['Name']} - {x['Title']}" for x in people[:10]),
+    }
+    for col in SOCIAL_COLS:
+        row[col] = socials.get(col, "")
+    row["Description"] = desc
+
+    filled = [row["Address"], row["Phone"], row["General email"], row["People (name - title)"]]
+    filled += [row[c] for c in SOCIAL_COLS]
+    row["_score"] = sum(1 for v in filled if v)
 
     base_cols = {"Company": company, "Website": domain}
-    all_emails, all_socials = set(), {}
-    email_rows, phone_rows, social_rows = [], [], []
-    for src, ems, phs, scs in contacts:
-        scs = {v for v in scs if social_platform(v) in plats}
-        all_emails |= ems
-        for v in sorted(scs):
-            all_socials.setdefault(social_platform(v), v)
-        email_rows += [dict(base_cols, Email=v, **{"Found on": src}) for v in sorted(ems)]
-        phone_rows += [dict(base_cols, Phone=v, **{"Found on": src}) for v in sorted(phs)]
-        social_rows += [dict(base_cols, Platform=social_platform(v), Link=v) for v in sorted(scs)]
-
-    profile = {"Company": company, "Website": domain, "Address": address, "Phone": phone,
-               "General email": pick_email(all_emails, domain), "Description": desc}
-    for pl in PLAT_ALL:
-        if pl in plats:
-            profile[pl] = all_socials.get(pl, "")
-
-    return {
-        "companies": [profile] if "Company profile" in want else [],
-        "people": [dict(base_cols, **x) for x in people] if "People" in want else [],
-        "emails": email_rows if "Emails" in want else [],
-        "phones": phone_rows if "Phones" in want else [],
-        "socials": social_rows if "Social profiles" in want else [],
-    }
+    return {"row": row, "people": [dict(base_cols, **x) for x in people]}
 
 
-def safe_process(url, comp, use_search, opts):
+def safe_process(url, hint, use_search):
     try:
-        return process_site(url, comp, use_search, opts)
+        return process_site(url, hint, use_search)
     except Exception:
         return None
 
 
-def run_batch(items, use_search, opts):
+def run_batch(items, use_search, status):
     seen, unique = set(), []
-    for url, comp in items:
+    for url, hint in items:
         key = urlparse(normalize(url)).netloc.replace("www.", "")
         if key and key not in seen:
             seen.add(key)
-            unique.append((url, comp))
-    unique = unique[:MAX_BULK]
-
-    res = {"companies": [], "people": [], "emails": [], "phones": [], "socials": [],
-           "failed": [], "want": list(opts["want"])}
+            unique.append((url, hint))
+    res = {"rows": [], "people": [], "failed": [], "stats": ""}
     if not unique:
         return res
     bar = st.progress(0.0)
-    status = st.empty()
     done = 0
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(safe_process, u, c, use_search, opts): u for u, c in unique}
+        futures = {ex.submit(safe_process, u, c, use_search): u for u, c in unique}
         for f in as_completed(futures):
             out = f.result()
             if out:
-                for k in ("companies", "people", "emails", "phones", "socials"):
-                    res[k] += out[k]
+                res["rows"].append(out["row"])
+                res["people"] += out["people"]
             else:
                 res["failed"].append(futures[f])
             done += 1
             bar.progress(done / len(unique))
-            status.write(f"Data nikal raha hun: {done}/{len(unique)} mukammal")
+            status.write(f"Step 3: websites se data nikal raha hun: {done}/{len(unique)} (kaam ki: {len(res['rows'])})")
     return res
 
 
 # ---------- results ----------
-def table(rows, subset, label, fname, key, empty_msg):
-    if rows:
-        df = pd.DataFrame(rows).drop_duplicates(subset=subset)
-        st.write(f"**{len(df)} {label}**")
-        st.dataframe(df, use_container_width=True)
-        st.download_button(f"Download {label} CSV", df.to_csv(index=False), fname, key=key)
-    else:
-        st.info(empty_msg)
-
-
 def show_results():
     res = st.session_state.get("res")
     if not res:
         return
-    order = [w for w in WANT_ALL if w in res.get("want", WANT_ALL)]
-    tabs = st.tabs(order)
-    for name, tab in zip(order, tabs):
-        with tab:
-            if name == "Company profile":
-                st.caption("Employees/Revenue (agar hon) sirf andaza (Estimate) hain. Source link khol kar verify karo.")
-                table(res["companies"], ["Website"], "companies", "companies.csv", "dl_c", "Koi company nahi mili.")
-            elif name == "People":
-                table(res["people"], ["Website", "Name"], "people", "people.csv", "dl_p", "Koi naam + title nahi mila.")
-            elif name == "Emails":
-                table(res["emails"], ["Website", "Email"], "emails", "emails.csv", "dl_e", "Koi email nahi mili.")
-            elif name == "Phones":
-                table(res["phones"], ["Website", "Phone"], "phones", "phones.csv", "dl_ph", "Koi phone nahi mila.")
-            else:
-                table(res["socials"], ["Website", "Link"], "social profiles", "social_profiles.csv", "dl_s",
-                      "Koi social profile nahi mila.")
+    if res.get("stats"):
+        st.success(res["stats"])
+    rows = res["rows"]
+    if rows:
+        df = pd.DataFrame(rows)
+        if "_score" in df.columns:
+            df = df.sort_values("_score", ascending=False).drop(columns=["_score"])
+        df = df.drop_duplicates(subset=["Website"])
+        st.dataframe(df, use_container_width=True)
+        st.download_button("Download CSV (sab data)", df.to_csv(index=False).encode("utf-8-sig"),
+                           "leads.csv", key="dl_master")
+        if res["people"]:
+            pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
+            st.download_button("Download People CSV (alag, har banda ek row)", pdf.to_csv(index=False).encode("utf-8-sig"),
+                               "people.csv", key="dl_people")
+    else:
+        st.warning("Koi data nahi nikla.")
     if res["failed"]:
-        st.error("Ye websites khul nahi sakin: " + ", ".join(res["failed"]))
+        with st.expander(f"{len(res['failed'])} websites khul nahi sakin"):
+            st.write(", ".join(res["failed"]))
 
 
 def read_sites_csv(up):
@@ -614,21 +744,115 @@ def read_sites_csv(up):
 
 
 # ---------- UI ----------
-tab_single, tab_bulk, tab_search = st.tabs(["Single website", "Bulk mode", "Client description search"])
+tab_search, tab_bulk, tab_single = st.tabs(["Client description search", "Bulk websites", "Single website"])
 
-with tab_single:
-    s1, s2 = st.columns(2)
-    url_input = s1.text_input("Website ka link", placeholder="example.com")
-    company_input = s2.text_input("Company ka naam (optional)")
-    if st.button("Dhoondo", key="single_btn") and url_input:
-        opts = {"want": WANT_ALL, "plats": PLAT_ALL}
-        st.session_state["res"] = run_batch([(url_input, company_input)], True, opts)
+with tab_search:
+    st.write("Client ki need likho: niche, country/city, kitni companies chahiye (jaise 100, 500), aur chaho to employees/revenue. Baqi sab tool khud karega aur ek CSV dega.")
+    desc = st.text_area("Client description", height=130,
+                        placeholder="Target: USA. Industry: real estate and dental. Need 200 companies")
+
+    niches, locations, country, target = [], [], "", 0
+    d_emp_min = d_emp_max = 0
+    d_rev_min = d_rev_max = 0.0
+
+    if desc.strip():
+        d_emp_min, d_emp_max, d_rev_min, d_rev_max = detect_filters(desc)
+        q_clean = clean_description(desc)
+        niches = [q_clean]
+        target = detect_count(desc)
+
+        api_key = get_secret("GEMINI_API_KEY")
+        if api_key:
+            wanted = [get_secret("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"]
+            models = tuple(m for m in dict.fromkeys(wanted) if m)
+            ai, err = ai_parse(desc, api_key, models)
+            if ai:
+                niches = [str(x) for x in ai.get("niches", [])][:6] or niches
+                locations = [str(x) for x in ai.get("locations", [])][:20]
+                country = str(ai.get("country", "") or "")
+                target = int(ai.get("count", 0) or 0) or target
+                d_emp_min = int(ai.get("emp_min", 0) or 0)
+                d_emp_max = int(ai.get("emp_max", 0) or 0)
+                d_rev_min = float(ai.get("rev_min_m", 0) or 0)
+                d_rev_max = float(ai.get("rev_max_m", 0) or 0)
+                st.success("AI ne description samjhi. Niches: " + " | ".join(niches)
+                           + (" | Locations: " + ", ".join(locations) if locations else "")
+                           + (f" | Country: {country}" if country else ""))
+            else:
+                st.warning("AI call fail hui, simple rules use ho rahe hain. Wajah: " + err)
+        else:
+            st.info("AI off hai (Secrets mein GEMINI_API_KEY nahi mili). Simple rules use ho rahe hain.")
+
+        if not re.search(r"\d", desc):
+            d_emp_min = d_emp_max = 0
+            d_rev_min = d_rev_max = 0.0
+        target = min(target, 10000)
+
+        st.caption(f"Target: {target or 'jitni mil jayen sab'} companies | Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} "
+                   f"| Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}")
+
+    if st.button("Dhoondo", key="search_btn") and desc.strip():
+        if DDGS is None:
+            st.error("Search library (ddgs) install nahi hui. requirements.txt mein `ddgs` likha hona chahiye, phir app Reboot karo.")
+            st.stop()
+
+        filters_on = bool(d_emp_min or d_emp_max or d_rev_min or d_rev_max)
+        status = st.empty()
+        queries = build_queries(niches, locations, country, target)
+        found, searches_done = discover(queries, target, status)
+        domains = list(found.keys())
+        if not domains:
+            st.error("Search se koi website nahi mili. Ho sakta hai free search ne thori der ke liye rok lagayi ho. 2-3 minute baad dobara try karo, ya description mein niche aur location saaf likho.")
+            st.stop()
+
+        limit = math.ceil(target * 1.4) if target else HARD_CAP
+        domains = domains[:limit]
+        stats = [f"{searches_done} searches se {len(found)} websites mili"]
+
+        infos = {}
+        kept = [(d, "") for d in domains]
+        if filters_on:
+            status.write(f"Step 2: {len(domains)} websites ka size/revenue check ho raha hai (slow)...")
+            names = {}
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = {ex.submit(name_for_domain, d): d for d in domains[:300]}
+                for f in as_completed(futs):
+                    nm = f.result()
+                    if nm:
+                        names[futs[f]] = nm
+            kept = []
+            bar2 = st.progress(0.0)
+            for n, (domain, name) in enumerate(names.items()):
+                status.write(f"Step 2: size/revenue {n + 1}/{len(names)}: {name}")
+                bar2.progress((n + 1) / max(len(names), 1))
+                info = enrich(name)
+                if passes(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max):
+                    kept.append((domain, name))
+                    infos[domain] = info
+            stats.append(f"size/revenue filter ke baad {len(kept)} bachin")
+
+        if not kept:
+            st.session_state["res"] = None
+            st.warning("Aap ki range mein kisi ka size/revenue data nahi mila. Range wider karo ya description se size/revenue hata do.")
+        else:
+            res = run_batch(kept, len(kept) <= 40, status)
+            for row in res["rows"]:
+                info = infos.get(row["Website"])
+                if info:
+                    row["Employees"] = fmt_emp(info["emp"])
+                    row["Revenue (Estimate)"] = fmt_rev(info["rev"])
+                    row["Source link"] = info["link"]
+                    row["Confidence"] = info["confidence"]
+            res["rows"].sort(key=lambda r: r["_score"], reverse=True)
+            if target:
+                res["rows"] = res["rows"][:target]
+            stats.append(f"{len(res['rows'])} companies ka data tayyar")
+            res["stats"] = " | ".join(stats)
+            st.session_state["res"] = res
+            status.write("Mukammal!")
 
 with tab_bulk:
-    st.write(f"Har line mein ek website. Company ka naam dena ho to comma lagao: `example.com, Example Corp`. Max {MAX_BULK} websites.")
-    want_b = st.multiselect("Kya nikalna hai", WANT_ALL, default=WANT_ALL, key="want_b")
-    plats_b = st.multiselect("Social platforms (kaun se chahiye)", PLAT_ALL, default=PLAT_ALL, key="plats_b")
-    search_b = st.checkbox("People ke liye web search bhi (slow, lekin zyada log milte hain)", value=True, key="search_b")
+    st.write("Har line mein ek website. Company ka naam dena ho to comma lagao: `example.com, Example Corp`.")
     text = st.text_area("Websites ki list", height=180, placeholder="example.com\nanother.com, Another Corp")
     up = st.file_uploader("Ya CSV upload karo", type="csv")
 
@@ -651,125 +875,24 @@ with tab_bulk:
                 items.append((w, comp))
 
     if items:
-        st.info(f"{len(items)} websites mili. Is dafa {min(len(items), MAX_BULK)} check hongi.")
+        st.info(f"{len(items)} websites mili.")
     if st.button("Bulk start karo", key="bulk_btn") and items:
-        if not want_b:
-            st.error("Kam az kam ek cheez 'Kya nikalna hai' mein chuno.")
-        else:
-            opts = {"want": want_b, "plats": plats_b or PLAT_ALL}
-            st.session_state["res"] = run_batch(items, search_b, opts)
+        status_b = st.empty()
+        res = run_batch(items[:HARD_CAP], len(items) <= 40, status_b)
+        res["rows"].sort(key=lambda r: r["_score"], reverse=True)
+        res["stats"] = f"{len(res['rows'])} websites ka data tayyar"
+        st.session_state["res"] = res
+        status_b.write("Mukammal!")
 
-with tab_search:
-    st.write("Client ki description likho. AI (agar key lagi ho) ya simple rules description samajh kar companies dhoondte hain.")
-    desc = st.text_area("Client description", height=110,
-                        placeholder="Med spas in NYC and Brooklyn, 10-50 employees, revenue $1M-$5M")
-    want_s = st.multiselect("Kya nikalna hai", WANT_ALL, default=["Company profile", "Emails", "Phones", "Social profiles"], key="want_s")
-    plats_s = st.multiselect("Social platforms (kaun se chahiye)", PLAT_ALL, default=PLAT_ALL, key="plats_s")
-    max_cand = st.slider("Kitni companies check karni hain", 10, 150, 40)
-    enrich_on = st.checkbox("Employees / revenue ka andaza bhi nikalo (slow)", value=True)
-    drop_blank = st.checkbox("Jin ka employees/revenue data na mile unhein hata do", value=True)
-    people_s = st.checkbox("People ke liye web search bhi (bohat slow)", value=False)
-
-    with st.expander("Manual filters (optional, 0 = description se lo)"):
-        m1, m2, m3, m4 = st.columns(4)
-        man_emp_min = m1.number_input("Min employees", min_value=0, value=0, step=1)
-        man_emp_max = m2.number_input("Max employees", min_value=0, value=0, step=1)
-        man_rev_min = m3.number_input("Min revenue, $M", min_value=0.0, value=0.0, step=0.5)
-        man_rev_max = m4.number_input("Max revenue, $M", min_value=0.0, value=0.0, step=0.5)
-
-    ai_queries = []
-    q_clean = ""
-    d_emp_min = d_emp_max = 0
-    d_rev_min = d_rev_max = 0.0
-
-    if desc.strip():
-        d_emp_min, d_emp_max, d_rev_min, d_rev_max = detect_filters(desc)
-        q_clean = clean_description(desc)
-
-        api_key = get_secret("GEMINI_API_KEY")
-        if api_key:
-            wanted = [get_secret("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"]
-            models = tuple(m for m in dict.fromkeys(wanted) if m)
-            ai, err = ai_parse(desc, api_key, models)
-            if ai:
-                ai_queries = [str(q) for q in ai.get("queries", [])][:5]
-                d_emp_min = int(ai.get("emp_min", 0) or 0)
-                d_emp_max = int(ai.get("emp_max", 0) or 0)
-                d_rev_min = float(ai.get("rev_min_m", 0) or 0)
-                d_rev_max = float(ai.get("rev_max_m", 0) or 0)
-                st.success("AI ne description samjhi. Queries: " + " | ".join(ai_queries))
-            else:
-                st.warning("AI call fail hui, purane rules use ho rahe hain. Wajah: " + err)
-        else:
-            st.info("AI off hai (Secrets mein GEMINI_API_KEY nahi mili). Simple rules use ho rahe hain.")
-
-        if man_emp_min or man_emp_max:
-            d_emp_min, d_emp_max = man_emp_min, man_emp_max
-        if man_rev_min or man_rev_max:
-            d_rev_min, d_rev_max = man_rev_min, man_rev_max
-
-        st.caption(f"Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}")
-
-    if st.button("Dhoondo", key="search_btn") and desc.strip():
-        filters_on = bool(d_emp_min or d_emp_max or d_rev_min or d_rev_max)
-        need_enrich = enrich_on or filters_on
-        want = list(want_s)
-        if need_enrich and "Company profile" not in want:
-            want = ["Company profile"] + want
-        opts = {"want": want, "plats": plats_s or PLAT_ALL}
-
-        status = st.empty()
-        bar = st.progress(0.0)
-        status.write("Step 1: companies ki list ban rahi hai...")
-        queries = list(ai_queries)
-        base_q = q_clean or desc.strip()
-        for q in (base_q, f"best {base_q}", f"top {base_q}", f"{base_q} contact us", f"{base_q} services"):
-            if q not in queries:
-                queries.append(q)
-        found = discover(queries)
-        domains = list(found.keys())[:max_cand]
-        if not domains:
-            st.error("Koi website nahi mili. Description badal kar try karo, ya thori der baad dobara.")
-            st.stop()
-
-        status.write(f"Step 2: {len(domains)} websites ke naam check ho rahe hain...")
-        names = {}
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            futs = {ex.submit(name_for_domain, d): d for d in domains}
-            for f in as_completed(futs):
-                nm = f.result()
-                if nm:
-                    names[futs[f]] = nm
-
-        kept, infos = [], {}
-        if need_enrich:
-            total = len(names)
-            for n, (domain, name) in enumerate(names.items()):
-                status.write(f"Step 3: size/revenue check {n + 1}/{total}: {name}")
-                bar.progress((n + 1) / max(total, 1))
-                info = enrich(name)
-                if passes(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max, drop_blank):
-                    kept.append((domain, name))
-                    infos[domain] = info
-        else:
-            kept = list(names.items())
-
-        if not kept:
-            st.session_state["res"] = None
-            st.warning(f"{len(names)} companies check hui, lekin kisi ka data aap ki range mein nahi mila. Range wider karo ya filter hata do.")
-        else:
-            status.write(f"Step 4: {len(kept)} companies ka data nikal raha hun...")
-            res = run_batch(kept, people_s, opts)
-            for row in res["companies"]:
-                info = infos.get(row["Website"])
-                if info:
-                    row["Employees"] = fmt_emp(info["emp"])
-                    row["Revenue (Estimate)"] = fmt_rev(info["rev"])
-                    row["Employees source"] = info["emp_src"]
-                    row["Revenue source"] = info["rev_src"]
-                    row["Source link"] = info["link"]
-                    row["Confidence"] = info["confidence"]
-            st.session_state["res"] = res
-            status.write(f"Mukammal! {len(names)} mein se {len(kept)} companies match hui.")
+with tab_single:
+    s1, s2 = st.columns(2)
+    url_input = s1.text_input("Website ka link", placeholder="example.com")
+    company_input = s2.text_input("Company ka naam (optional)")
+    if st.button("Dhoondo", key="single_btn") and url_input:
+        status_s = st.empty()
+        res = run_batch([(url_input, company_input)], True, status_s)
+        res["stats"] = f"{len(res['rows'])} website ka data tayyar"
+        st.session_state["res"] = res
+        status_s.write("Mukammal!")
 
 show_results()
