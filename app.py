@@ -31,7 +31,9 @@ st.caption("Built by Faiz Khan")
 WORKERS = 24
 HARD_CAP = 3000
 SEARCH_LOCK = threading.Lock()
-OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter"]
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 OSM_HEADERS = {"User-Agent": "FaizLeadFinder/1.0"}
@@ -91,7 +93,7 @@ BLOCK_DOMAINS = ["yelp.", "facebook.", "instagram.", "linkedin.", "tripadvisor."
                  "angi.", "porch.", "houzz.", "clutch.co", "g2.com", "capterra.", "trustpilot.",
                  "crunchbase.", "owler.", "yellowbook.", "alignable.", "merchantcircle.", "citysearch.",
                  "dexknows.", "local.com", "hotfrog.", "brownbook.", "showmelocal.", "bizapedia.",
-                 "grokipedia.", "openstreetmap.", "linkedin.", "wix.com", "weebly.com", "godaddysites."]
+                 "grokipedia.", "openstreetmap.", "wix.com", "weebly.com", "godaddysites."]
 
 STATE_LIST = [
     ("California", "CA"), ("Texas", "TX"), ("Florida", "FL"), ("New York", "NY"), ("Pennsylvania", "PA"),
@@ -108,43 +110,52 @@ STATE_LIST = [
 ]
 STATE_BY_NAME = {n.lower(): c for n, c in STATE_LIST}
 CODE2NAME = {c: n for n, c in STATE_LIST}
+AMBIGUOUS_CODES = {"IN", "OR", "ME", "OK", "HI"}
 US_NAMES = ("usa", "us", "u.s.", "u.s.a.", "united states", "united states of america", "america")
 ALIASES = {"nyc": "New York City", "la": "Los Angeles", "sf": "San Francisco"}
+CITY_TO_STATE = {
+    "new york city": "New York", "brooklyn": "New York", "manhattan": "New York", "queens": "New York",
+    "bronx": "New York", "staten island": "New York", "los angeles": "California",
+    "san francisco": "California", "san diego": "California", "chicago": "Illinois", "houston": "Texas",
+    "dallas": "Texas", "austin": "Texas", "miami": "Florida", "boston": "Massachusetts",
+    "seattle": "Washington", "atlanta": "Georgia", "philadelphia": "Pennsylvania", "phoenix": "Arizona",
+    "denver": "Colorado", "las vegas": "Nevada",
+}
 
-# regex in description -> (OpenStreetMap tags, relevance keywords)
+# regex in description -> (OpenStreetMap tags, relevance keywords, search phrase)
 TAG_MAP = [
-    (r"dent(al|ist)|orthodont", ["amenity=dentist"], ["dental", "dentist", "orthodont"]),
+    (r"dent(al|ist)|orthodont", ["amenity=dentist"], ["dental", "dentist", "orthodont"], "dentist"),
     (r"real estate|realtor|realty|estate agen|property agen", ["office=estate_agent"],
-     ["estate", "realtor", "realty", "property", "properties", "homes", "broker"]),
-    (r"lawyer|attorney|law firm", ["office=lawyer"], ["law", "attorney", "lawyer"]),
-    (r"accountant|\bcpa\b|accounting", ["office=accountant"], ["account", "cpa", "tax"]),
-    (r"insurance", ["office=insurance"], ["insurance"]),
-    (r"doctor|physician", ["amenity=doctors"], ["doctor", "physician", "medical"]),
-    (r"\bclinic", ["amenity=clinic"], ["clinic", "medical", "health"]),
-    (r"veterinar|\bvets?\b", ["amenity=veterinary"], ["veterinar", "animal", "pet"]),
-    (r"pharmac", ["amenity=pharmacy"], ["pharmacy"]),
-    (r"\bgyms?\b|fitness", ["leisure=fitness_centre"], ["gym", "fitness"]),
-    (r"restaurant", ["amenity=restaurant"], ["restaurant", "menu"]),
-    (r"hotel", ["tourism=hotel"], ["hotel", "rooms"]),
-    (r"salon|\bhair", ["shop=hairdresser"], ["salon", "hair"]),
-    (r"med ?spa|aesthetic|beauty|\bspa\b", ["shop=beauty"], ["spa", "aesthetic", "beauty", "skin"]),
-    (r"auto repair|mechanic", ["shop=car_repair"], ["auto", "repair", "mechanic"]),
-    (r"car dealer", ["shop=car"], ["dealer", "car"]),
-    (r"plumb", ["craft=plumber"], ["plumb"]),
-    (r"electrician|electrical", ["craft=electrician"], ["electric"]),
-    (r"hvac|heating|air conditioning", ["craft=hvac"], ["hvac", "heating", "cooling"]),
-    (r"roof", ["craft=roofer"], ["roof"]),
+     ["estate", "realtor", "realty", "property", "properties", "homes", "broker"], "real estate agency"),
+    (r"lawyer|attorney|law firm", ["office=lawyer"], ["law", "attorney", "lawyer"], "law firm"),
+    (r"accountant|\bcpa\b|accounting", ["office=accountant"], ["account", "cpa", "tax"], "accountant"),
+    (r"insurance", ["office=insurance"], ["insurance"], "insurance agency"),
+    (r"doctor|physician", ["amenity=doctors"], ["doctor", "physician", "medical"], "doctor"),
+    (r"\bclinic", ["amenity=clinic"], ["clinic", "medical", "health"], "clinic"),
+    (r"veterinar|\bvets?\b", ["amenity=veterinary"], ["veterinar", "animal", "pet"], "veterinarian"),
+    (r"pharmac", ["amenity=pharmacy"], ["pharmacy"], "pharmacy"),
+    (r"\bgyms?\b|fitness", ["leisure=fitness_centre"], ["gym", "fitness"], "gym"),
+    (r"restaurant", ["amenity=restaurant"], ["restaurant", "menu"], "restaurant"),
+    (r"hotel", ["tourism=hotel"], ["hotel", "rooms"], "hotel"),
+    (r"salon|\bhair", ["shop=hairdresser"], ["salon", "hair"], "hair salon"),
+    (r"med ?spa|aesthetic|beauty|\bspa\b", ["shop=beauty"], ["spa", "aesthetic", "beauty", "skin"], "med spa"),
+    (r"auto repair|mechanic", ["shop=car_repair"], ["auto", "repair", "mechanic"], "auto repair"),
+    (r"car dealer", ["shop=car"], ["dealer", "car"], "car dealer"),
+    (r"plumb", ["craft=plumber"], ["plumb"], "plumber"),
+    (r"electrician|electrical", ["craft=electrician"], ["electric"], "electrician"),
+    (r"hvac|heating|air conditioning", ["craft=hvac"], ["hvac", "heating", "cooling"], "hvac contractor"),
+    (r"roof", ["craft=roofer"], ["roof"], "roofing contractor"),
     (r"construction|contractor|builder", ["office=construction_company", "craft=builder"],
-     ["construction", "contractor", "builder"]),
-    (r"architect", ["office=architect"], ["architect"]),
-    (r"marketing|advertising", ["office=advertising_agency"], ["marketing", "advertising"]),
-    (r"software|it company|it services", ["office=it"], ["software", "technology"]),
-    (r"\bbanks?\b", ["amenity=bank"], ["bank"]),
-    (r"daycare|child care", ["amenity=kindergarten"], ["daycare", "child care"]),
+     ["construction", "contractor", "builder"], "construction company"),
+    (r"architect", ["office=architect"], ["architect"], "architect"),
+    (r"marketing|advertising", ["office=advertising_agency"], ["marketing", "advertising"], "marketing agency"),
+    (r"software|it company|it services", ["office=it"], ["software", "technology"], "software company"),
+    (r"\bbanks?\b", ["amenity=bank"], ["bank"], "bank"),
+    (r"daycare|child care", ["amenity=kindergarten"], ["daycare", "child care"], "daycare"),
 ]
 GENERIC_WORDS = {"company", "companies", "services", "service", "near", "best", "local", "agency", "agent",
                  "agents", "clinic", "office", "group", "business", "businesses", "target", "industry",
-                 "countries", "country", "need", "want", "both", "others", "other"}
+                 "countries", "country", "need", "want", "both", "others", "other", "each"}
 
 UNIT = r"(?:billion|million|thousand|bn|mm|b|m|k)"
 MONEY_RE = re.compile(r"\$\s?(\d[\d,]*\.?\d*)\s*(billion|million|thousand|bn|mm|b|m|k)?\b", re.I)
@@ -156,6 +167,12 @@ EMP_ONE_RE = re.compile(r"(\d[\d,]*)\+?\s*(?:employees|staff)", re.I)
 def normalize(url):
     url = url.strip()
     return url if url.startswith("http") else "https://" + url
+
+
+def site_key(url):
+    if str(url).startswith("osm-"):
+        return str(url)
+    return urlparse(normalize(url)).netloc.replace("www.", "")
 
 
 def fetch(url):
@@ -231,6 +248,14 @@ def valid_email(e):
     return mx_ok(dom)
 
 
+def decode_cf(hexstr):
+    try:
+        key = int(hexstr[:2], 16)
+        return "".join(chr(int(hexstr[i:i + 2], 16) ^ key) for i in range(2, len(hexstr), 2))
+    except Exception:
+        return ""
+
+
 def norm_phone(raw):
     raw = (raw or "").strip()
     digits = re.sub(r"\D", "", raw)
@@ -253,6 +278,28 @@ def norm_state(s):
 def zip5(z):
     m = re.search(r"\d{5}", z or "")
     return m.group(0) if m else ""
+
+
+def norm_loc(loc):
+    name = ALIASES.get(loc.strip().lower(), loc.strip())
+    if len(name) == 2 and name.upper() in CODE2NAME:
+        return CODE2NAME[name.upper()]
+    return name
+
+
+def wanted_states(locations):
+    if not locations:
+        return None
+    out = set()
+    for l in locations:
+        n = norm_loc(l).lower()
+        if n in STATE_BY_NAME:
+            out.add(n)
+        elif n in CITY_TO_STATE:
+            out.add(CITY_TO_STATE[n].lower())
+        else:
+            return None
+    return out
 
 
 def company_from_html(html, domain):
@@ -283,6 +330,12 @@ def extract_contacts(html, base):
         href = a["href"].strip()
         low = href.lower()
 
+        if "email-protection#" in low:
+            d = decode_cf(href.split("#", 1)[1])
+            if d:
+                emails.add(d.lower())
+            continue
+
         if low.startswith("mailto:"):
             emails.add(href[7:].split("?")[0].strip().lower())
             continue
@@ -302,7 +355,14 @@ def extract_contacts(html, base):
         if same_site and has_key:
             pages.add(full.split("#")[0])
 
+    for tag in soup.find_all(attrs={"data-cfemail": True}):
+        d = decode_cf(tag.get("data-cfemail", ""))
+        if d:
+            emails.add(d.lower())
+
     text = soup.get_text(" ")[:200000]
+    text = re.sub(r"\s*[\[\(]\s*at\s*[\]\)]\s*", "@", text, flags=re.I)
+    text = re.sub(r"\s*[\[\(]\s*dot\s*[\]\)]\s*", ".", text, flags=re.I)
     for e in EMAIL_RE.findall(text):
         emails.add(e.lower())
     for p in PHONE_RE.findall(text):
@@ -560,25 +620,32 @@ def detect_filters(desc):
 
 
 def detect_count(desc):
+    each = bool(re.search(r"\beach\b|\bper\b|\bevery\b", desc, re.I))
     m = re.search(r"\b(\d[\d,]*)\s*\+?\s*(?:companies|company|leads|records|results|businesses|contacts|websites)\b", desc, re.I)
+    if not m:
+        m = re.search(r"\b(?:companies|company|leads|businesses)\s*[:\-]?\s*(\d[\d,]*)\b", desc, re.I)
+    if not m:
+        m = re.search(r"\b(\d[\d,]*)\s+(?:each|per)\b", desc, re.I)
     if not m:
         m = re.search(r"\b(?:need|want|get|give|find)\s+(?:me\s+)?(\d[\d,]*)\b", desc, re.I)
     if m:
         try:
-            return min(int(m.group(1).replace(",", "")), 10000)
+            return min(int(m.group(1).replace(",", "")), 10000), each
         except Exception:
-            return 0
-    return 0
+            return 0, each
+    return 0, each
 
 
-def tags_from_text(text):
+def groups_from_text(text):
     low = text.lower()
-    tags, kws = [], []
-    for pat, t, k in TAG_MAP:
+    groups = []
+    for pat, tags, kws, phrase in TAG_MAP:
         if re.search(pat, low):
-            tags += t
-            kws += k
-    return list(dict.fromkeys(tags)), list(dict.fromkeys(kws))
+            groups.append({"label": kws[0], "tags": list(tags), "kws": list(kws), "q": phrase})
+    labels = [g["label"] for g in groups]
+    if "dental" in labels:
+        groups = [g for g in groups if g["label"] != "clinic"]
+    return groups
 
 
 def get_secret(name, default=""):
@@ -596,8 +663,9 @@ def ai_parse(desc, api_key, models):
         '"locations": ["cities/states/regions mentioned; empty list if only a whole country"], '
         '"country": "USA or other country name or empty", '
         '"osm_tags": ["up to 6 OpenStreetMap tags as key=value for these business types, e.g. amenity=dentist, office=estate_agent; empty list if unsure"], '
-        '"count": 0, "emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
+        '"count": 0, "per_niche": false, "emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
         "count = how many companies the client wants (0 if not stated). "
+        "per_niche = true if the count applies to EACH niche separately (for example '100 each'). "
         "Never invent employee or revenue numbers: use 0 unless the client explicitly states them. "
         "Revenue is in millions of USD.\n\nRequest: " + desc
     )
@@ -626,54 +694,84 @@ def ai_parse(desc, api_key, models):
 
 # ---------- discovery: OpenStreetMap ----------
 @lru_cache(maxsize=256)
-def geocode_area(q):
+def geocode_info(q):
     try:
-        r = requests.get("https://nominatim.openstreetmap.org/search",
-                         params={"q": q, "format": "json", "limit": 1}, headers=OSM_HEADERS, timeout=15)
+        r = requests.get(NOMINATIM, params={"q": q, "format": "json", "limit": 1},
+                         headers=OSM_HEADERS, timeout=15)
         data = r.json()
         if not data:
             return None
         d = data[0]
+        bb = d.get("boundingbox")
+        bbox = tuple(float(x) for x in bb) if bb else None
+        aid = None
         if d.get("osm_type") == "relation":
-            return 3600000000 + int(d["osm_id"])
-        if d.get("osm_type") == "way":
-            return 2400000000 + int(d["osm_id"])
+            aid = 3600000000 + int(d["osm_id"])
+        elif d.get("osm_type") == "way":
+            aid = 2400000000 + int(d["osm_id"])
+        return {"id": aid, "bbox": bbox}
     except Exception:
         return None
-    return None
 
 
-def area_clause(loc, country):
-    name = ALIASES.get(loc.strip().lower(), loc.strip())
+def area_info(loc, country):
+    name = norm_loc(loc)
     code = STATE_BY_NAME.get(name.lower())
     if code:
-        return f'area["ISO3166-2"="US-{code}"]->.a;'
+        info = geocode_info(f"{name} State, United States")
+        time.sleep(1)
+        return f'area["ISO3166-2"="US-{code}"]->.a;', (info or {}).get("bbox")
     q = name
     if country.strip().lower() in US_NAMES and "usa" not in name.lower():
         q = f"{name}, USA"
-    aid = geocode_area(q)
+    info = geocode_info(q)
     time.sleep(1)
-    if aid:
-        return f"area(id:{aid})->.a;"
-    return None
+    if info and info.get("id"):
+        return f"area(id:{info['id']})->.a;", info.get("bbox")
+    return None, None
 
 
-def osm_fetch(clause, tag_list):
+def make_tiles(bbox, step=1.5):
+    if not bbox:
+        return [None]
+    south, north, west, east = bbox
+    if (north - south) <= step * 1.3 and (east - west) <= step * 1.3:
+        return [None]
+    while math.ceil((north - south) / step) * math.ceil((east - west) / step) > 60:
+        step *= 1.4
+    tiles = []
+    lat = south
+    while lat < north:
+        lon = west
+        while lon < east:
+            tiles.append((round(lat, 4), round(lon, 4), round(min(lat + step, north), 4), round(min(lon + step, east), 4)))
+            lon += step
+        lat += step
+    return tiles
+
+
+def osm_fetch(clause, tag_list, need_website=True, tile=None):
+    bb = f"({tile[0]},{tile[1]},{tile[2]},{tile[3]})" if tile else ""
     parts = []
     for kv in tag_list:
         k, v = kv.split("=", 1)
-        for wk in ("website", "contact:website"):
-            parts.append(f'nwr["{k}"="{v}"]["{wk}"](area.a);')
-    q = "[out:json][timeout:180];" + clause + "(" + "".join(parts) + ");out tags;"
+        if need_website:
+            for wk in ("website", "contact:website"):
+                parts.append(f'nwr["{k}"="{v}"]["{wk}"](area.a){bb};')
+        else:
+            parts.append(f'nwr["{k}"="{v}"]["name"](area.a){bb};')
+    q = "[out:json][timeout:90];" + clause + "(" + "".join(parts) + ");out tags;"
+    last = "koi jawab nahi"
     for ep in OVERPASS:
         try:
-            r = requests.post(ep, data={"data": q}, headers=OSM_HEADERS, timeout=200)
+            r = requests.post(ep, data={"data": q}, headers=OSM_HEADERS, timeout=120)
             if r.status_code == 200:
-                return r.json().get("elements", [])
-        except Exception:
-            pass
-        time.sleep(3)
-    return None
+                return r.json().get("elements", []), ""
+            last = f"HTTP {r.status_code}"
+        except Exception as e:
+            last = str(e)[:80]
+        time.sleep(2)
+    return None, last
 
 
 def osm_category(tags):
@@ -683,50 +781,74 @@ def osm_category(tags):
     return ""
 
 
-def discover_osm(tag_list, locations, country, goal, status, budget):
+def discover_osm(tag_list, locations, country, goal, status, budget, need_website=True, known=None, label=""):
+    known = known or set()
     found, notes = {}, []
     start = time.time()
     if locations:
-        regions = list(locations)
+        regions = list(dict.fromkeys(norm_loc(l) for l in locations))
     elif country.strip().lower() in US_NAMES:
         regions = [n for n, _ in STATE_LIST]
     elif country.strip():
         regions = [country]
     else:
         return found, ["Country/location nahi mili, is liye OpenStreetMap skip hui"]
+    kind = "website wali" if need_website else "bina website wali"
     for loc in regions:
         if time.time() - start > budget:
             notes.append("OpenStreetMap ka time limit khatam hua")
             break
-        clause = area_clause(loc, country)
+        clause, bbox = area_info(loc, country)
         if not clause:
             notes.append(f"{loc}: OpenStreetMap par area nahi mili")
             continue
-        els = osm_fetch(clause, tag_list)
-        if els is None:
-            notes.append(f"{loc}: OpenStreetMap server ne jawab nahi diya")
-            continue
-        for el in els:
-            tags = el.get("tags", {})
-            site = (tags.get("website") or tags.get("contact:website") or "").split(";")[0].strip()
-            if not site:
+        tiles = make_tiles(bbox)
+        failed, last_err = 0, ""
+        for ti, tile in enumerate(tiles):
+            if time.time() - start > budget:
+                notes.append("OpenStreetMap ka time limit khatam hua")
+                break
+            els, err = osm_fetch(clause, tag_list, need_website, tile)
+            if els is None:
+                failed += 1
+                last_err = err
                 continue
-            host = urlparse(normalize(site)).netloc.lower().replace("www.", "")
-            if not host or "." not in host or any(b in host for b in BLOCK_DOMAINS):
-                continue
-            found.setdefault(host, {"hint": tags.get("name", ""), "tags": tags, "src": "OpenStreetMap"})
-        status.write(f"Step 1: {loc} mukammal | ab tak websites mili: {len(found)}")
-        if goal and len(found) >= goal:
+            for el in els:
+                tags = el.get("tags", {})
+                site = (tags.get("website") or tags.get("contact:website") or "").split(";")[0].strip()
+                if site:
+                    host = urlparse(normalize(site)).netloc.lower().replace("www.", "")
+                    if not host or "." not in host or any(b in host for b in BLOCK_DOMAINS):
+                        continue
+                    key = host
+                else:
+                    if need_website or not tags.get("name"):
+                        continue
+                    has_contact = (tags.get("phone") or tags.get("contact:phone") or tags.get("email")
+                                   or tags.get("contact:email") or tags.get("addr:street"))
+                    if not has_contact:
+                        continue
+                    key = f"osm-{el.get('type', 'x')}-{el.get('id', '0')}"
+                if key in known or key in found:
+                    continue
+                found[key] = {"hint": tags.get("name", ""), "tags": tags, "src": "OpenStreetMap"}
+            status.write(f"Step 1: {label} | {loc} hissa {ti + 1}/{len(tiles)} ({kind}) | mili: {len(found) + len(known)}")
+            if goal and len(found) + len(known) >= goal:
+                break
+            time.sleep(1)
+        if failed:
+            notes.append(f"{loc} ({label}, {kind}): {failed}/{len(tiles)} hisse OpenStreetMap se nahi aaye ({last_err})")
+        if goal and len(found) + len(known) >= goal:
             break
-        time.sleep(1.5)
+        time.sleep(1)
     return found, notes
 
 
 # ---------- discovery: web search (support) ----------
-def build_queries(niches, locations, country, goal):
+def build_queries(niches, locations, country):
     niches = [n for n in niches if n] or [""]
-    locs = [l for l in locations if l] or ([country] if country else [""])
-    variants = ["{n} {l}", "best {n} {l}", "{n} {l} contact"]
+    locs = [norm_loc(l) for l in locations if l] or ([country] if country else [""])
+    variants = ["{n} in {l}", "best {n} in {l}", "{n} {l} contact"]
     queries = []
     for v in variants:
         for l in locs:
@@ -735,11 +857,11 @@ def build_queries(niches, locations, country, goal):
     return list(dict.fromkeys(queries))
 
 
-def discover_web(niches, locations, country, kws, goal, status, budget, known):
+def discover_web(niches, locations, country, kws, goal, status, budget, known, label=""):
     found = {}
     if DDGS is None:
         return found
-    queries = build_queries(niches, locations, country, goal)
+    queries = build_queries(niches, locations, country)
     start = time.time()
     done = 0
     with SEARCH_LOCK:
@@ -747,7 +869,7 @@ def discover_web(niches, locations, country, kws, goal, status, budget, known):
             if time.time() - start > budget:
                 break
             try:
-                results = DDGS().text(q, max_results=30)
+                results = DDGS().text(q, region="us-en", max_results=30)
             except Exception:
                 results = []
             for r in results or []:
@@ -759,7 +881,7 @@ def discover_web(niches, locations, country, kws, goal, status, budget, known):
                     continue
                 found.setdefault(host, {"hint": "", "tags": None, "src": "Web search", "kws": kws})
             done += 1
-            status.write(f"Step 1b: web search {done}/{len(queries)} | extra websites: {len(found)}")
+            status.write(f"Step 1b: {label} web search {done}/{len(queries)} | extra websites: {len(found)}")
             if goal and len(known) + len(found) >= goal:
                 break
             time.sleep(0.4)
@@ -812,11 +934,15 @@ def osm_contact(tags):
 
 
 def process_site(item, use_search):
-    base = normalize(item["url"])
-    domain = urlparse(base).netloc.replace("www.", "")
+    key = item["url"]
     tags = item.get("tags") or {}
     osm = osm_contact(tags) if tags else None
-    html = fetch(base)
+    if str(key).startswith("osm-"):
+        base, domain, html = "", "", None
+    else:
+        base = normalize(key)
+        domain = urlparse(base).netloc.replace("www.", "")
+        html = fetch(base)
 
     kws = item.get("kws")
     if html and kws and item.get("src") == "Web search":
@@ -852,6 +978,11 @@ def process_site(item, use_search):
         addr[k] = (osm[k] if osm else "") or prof[k]
     addr["state"] = norm_state(addr["state"])
     addr["zip"] = zip5(addr["zip"])
+
+    want_states = item.get("states")
+    if want_states and item.get("src") == "Web search" and addr["state"]:
+        if addr["state"].lower() not in want_states:
+            return None
 
     stem = domain.split(".")[0]
     cand_emails = list(osm["emails"]) if osm else []
@@ -901,10 +1032,18 @@ def process_site(item, use_search):
             break
     general = general or (emails[0] if emails else "")
 
+    if html:
+        wstatus = "OK"
+    elif not domain:
+        wstatus = "No website listed"
+    else:
+        wstatus = "Not reachable"
+
     row = {
         "Company": company,
+        "Niche": item.get("group", ""),
         "Website": domain,
-        "Website status": "OK" if html else "Not reachable",
+        "Website status": wstatus,
         "Category": osm_category(tags) if tags else "",
         "Street": addr["street"],
         "City": addr["city"],
@@ -939,7 +1078,7 @@ def safe_process(item, use_search):
 def run_batch(items, use_search, status):
     seen, unique = set(), []
     for it in items:
-        key = urlparse(normalize(it["url"])).netloc.replace("www.", "")
+        key = site_key(it["url"])
         if key and key not in seen:
             seen.add(key)
             unique.append(it)
@@ -960,12 +1099,12 @@ def run_batch(items, use_search, status):
             done += 1
             if done % 5 == 0 or done == len(unique):
                 bar.progress(done / len(unique))
-                status.write(f"Step 2: websites se data nikal raha hun: {done}/{len(unique)} | kaam ke rows: {len(res['rows'])}")
+                status.write(f"Step 2: data nikal raha hun: {done}/{len(unique)} | kaam ke rows: {len(res['rows'])}")
     return res
 
 
 # ---------- results ----------
-COLS = ["Company", "Website", "Website status", "Category", "Street", "City", "State", "ZIP", "Phone",
+COLS = ["Company", "Niche", "Website", "Website status", "Category", "Street", "City", "State", "ZIP", "Phone",
         "All phones", "General email", "All emails", "People (name - title)"] + SOCIAL_COLS + ["Source", "Description"]
 
 
@@ -982,7 +1121,8 @@ def show_results():
         df = pd.DataFrame(rows)
         if "_score" in df.columns:
             df = df.sort_values("_score", ascending=False).drop(columns=["_score"])
-        df = df.drop_duplicates(subset=["Website"])
+        df["_k"] = df["Website"].where(df["Website"] != "", df["Company"] + "|" + df["Street"])
+        df = df.drop_duplicates(subset=["_k"]).drop(columns=["_k"])
         cols = [c for c in COLS if c in df.columns] + [c for c in df.columns if c not in COLS]
         df = df[cols]
         st.dataframe(df, use_container_width=True)
@@ -995,7 +1135,7 @@ def show_results():
     else:
         st.warning("Koi data nahi nikla.")
     if res["failed"]:
-        with st.expander(f"{len(res['failed'])} websites skip hui (khuli nahi ya niche se match nahi)"):
+        with st.expander(f"{len(res['failed'])} websites skip hui (khuli nahi, niche ya location se match nahi)"):
             st.write(", ".join(res["failed"]))
 
 
@@ -1010,19 +1150,21 @@ def read_sites_csv(up):
 
 
 def manual_item(url, hint=""):
-    return {"url": url, "hint": hint, "tags": None, "src": "Manual", "kws": None}
+    return {"url": url, "hint": hint, "tags": None, "src": "Manual", "kws": None, "group": ""}
 
 
 # ---------- UI ----------
 tab_search, tab_bulk, tab_single = st.tabs(["Client description search", "Bulk websites", "Single website"])
 
 with tab_search:
-    st.write("Client ki need likho: niche, country/city/state, kitni companies chahiye (jaise 100, 500), aur chaho to employees/revenue. Baqi sab tool khud karega aur ek CSV dega.")
+    st.write("Client ki need likho: niche, country/state/city, kitni companies chahiye (jaise `100 each`), aur chaho to employees/revenue. Baqi sab tool khud karega aur ek CSV dega.")
     desc = st.text_area("Client description", height=130,
-                        placeholder="Target: USA. Industry: real estate and dental. Need 200 companies")
+                        placeholder="Target: NY, USA. Industry: real estate and dental. Companies 100 each")
 
-    niches, locations, country, target = [], [], "", 0
-    osm_tags, kws = [], []
+    niches, locations, country = [], [], ""
+    target, each = 0, False
+    groups = []
+    per_group = 0
     d_emp_min = d_emp_max = 0
     d_rev_min = d_rev_max = 0.0
 
@@ -1030,9 +1172,16 @@ with tab_search:
         d_emp_min, d_emp_max, d_rev_min, d_rev_max = detect_filters(desc)
         q_clean = clean_description(desc)
         niches = [q_clean]
-        target = detect_count(desc)
-        osm_tags, kws = tags_from_text(desc)
+        target, each = detect_count(desc)
+        groups = groups_from_text(desc)
+
         locations = [n for n, _ in STATE_LIST if re.search(r"\b" + re.escape(n) + r"\b", desc, re.I)]
+        for m in re.finditer(r"\b([A-Z]{2})\b", desc):
+            c = m.group(1)
+            if c in CODE2NAME and c not in AMBIGUOUS_CODES and CODE2NAME[c] not in locations:
+                locations.append(CODE2NAME[c])
+        if re.search(r"\bnyc\b|new york city", desc, re.I):
+            locations = [l for l in locations if l != "New York"] + ["New York City"]
         if re.search(r"\b(usa|u\.s\.a?\.?|united states|america)\b", desc, re.I):
             country = "USA"
 
@@ -1044,11 +1193,17 @@ with tab_search:
             if ai:
                 niches = [str(x) for x in ai.get("niches", [])][:6] or niches
                 ai_locs = [str(x) for x in ai.get("locations", []) if str(x).strip()][:20]
-                locations = ai_locs or locations
+                if ai_locs:
+                    locations = list(dict.fromkeys([norm_loc(x) for x in ai_locs] + locations))
                 country = str(ai.get("country", "") or "") or country
-                target = int(ai.get("count", 0) or 0) or target
-                good = [str(t) for t in ai.get("osm_tags", []) if re.fullmatch(r"[a-z_:]+=[a-z_]+", str(t))]
-                osm_tags = list(dict.fromkeys(osm_tags + good))
+                if int(ai.get("count", 0) or 0):
+                    target = int(ai.get("count", 0))
+                each = each or bool(ai.get("per_niche"))
+                known_tags = {t for g in groups for t in g["tags"]}
+                extra = [str(t) for t in ai.get("osm_tags", [])
+                         if re.fullmatch(r"[a-z_:]+=[a-z_]+", str(t)) and str(t) not in known_tags]
+                if extra:
+                    groups.append({"label": "other", "tags": extra, "kws": [], "q": niches[0]})
                 d_emp_min = int(ai.get("emp_min", 0) or 0)
                 d_emp_max = int(ai.get("emp_max", 0) or 0)
                 d_rev_min = float(ai.get("rev_min_m", 0) or 0)
@@ -1061,46 +1216,78 @@ with tab_search:
         else:
             st.info("AI off hai (Secrets mein GEMINI_API_KEY nahi mili). Simple rules use ho rahe hain.")
 
-        if not kws:
-            for n in niches:
-                for w in re.findall(r"[a-z]{5,}", n.lower()):
-                    if w not in GENERIC_WORDS:
-                        kws.append(w)
-            kws = list(dict.fromkeys(kws))
+        general_kws = []
+        for n in niches:
+            for w in re.findall(r"[a-z]{5,}", n.lower()):
+                if w not in GENERIC_WORDS:
+                    general_kws.append(w)
+        general_kws = list(dict.fromkeys(general_kws))
+        if not groups and niches:
+            groups = [{"label": "", "tags": [], "kws": general_kws, "q": niches[0]}]
+        for g in groups:
+            if not g["kws"]:
+                g["kws"] = general_kws
+
         if not re.search(r"\d", desc):
             d_emp_min = d_emp_max = 0
             d_rev_min = d_rev_max = 0.0
         target = min(target, 10000)
+        if target:
+            per_group = target if (each or len(groups) <= 1) else math.ceil(target / len(groups))
 
-        st.caption(f"Target: {target or 'jitni mil jayen sab'} companies | OpenStreetMap tags: {', '.join(osm_tags) or 'koi nahi (sirf web search)'} "
-                   f"| Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}")
+        st.caption(
+            f"Locations: {', '.join(locations) or country or 'koi nahi'} | "
+            f"Niches: {', '.join(g['label'] or g['q'] for g in groups) or '-'} | "
+            f"Har niche ka target: {per_group or 'jitni mil jayen sab'} | "
+            f"Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}"
+        )
 
     if st.button("Dhoondo", key="search_btn") and desc.strip():
-        if not osm_tags and DDGS is None:
+        if not groups:
+            st.error("Niche samajh nahi aaya. Description mein business type saaf likho (jaise dental, real estate).")
+            st.stop()
+        if not any(g["tags"] for g in groups) and DDGS is None:
             st.error("Search library (ddgs) install nahi hui. requirements.txt mein `ddgs` likha hona chahiye, phir app Reboot karo.")
             st.stop()
 
         filters_on = bool(d_emp_min or d_emp_max or d_rev_min or d_rev_max)
         status = st.empty()
-        goal = math.ceil(target * 1.25) if target else 0
-        budget = 1200 if target > 500 else 600
+        budget = 1200 if per_group > 300 else 600
+        want_states = wanted_states(locations)
 
-        found, notes, n_osm, n_web = {}, [], 0, 0
-        if osm_tags:
-            osm_found, notes = discover_osm(osm_tags, locations, country, goal, status, budget)
-            found.update(osm_found)
-            n_osm = len(found)
-        if (not osm_tags) or (goal and len(found) < goal) or len(found) < 30:
-            web_found = discover_web(niches, locations, country, kws, goal, status, 180, found)
-            found.update(web_found)
-            n_web = len(web_found)
+        all_found, notes, stat_lines = {}, [], []
+        for g in groups:
+            label = g["label"] or g["q"]
+            goal_g = math.ceil(per_group * 1.25) if per_group else 0
+            f_all, n_site, n_nosite, n_web = {}, 0, 0, 0
+            if g["tags"]:
+                f_site, nts = discover_osm(g["tags"], locations, country, goal_g, status, budget, True, None, label)
+                notes += nts
+                f_all.update(f_site)
+                n_site = len(f_site)
+                if (goal_g and len(f_all) < goal_g) or (not goal_g and len(f_all) < 30):
+                    f_ns, nts2 = discover_osm(g["tags"], locations, country, goal_g, status, budget, False,
+                                              set(f_all) | set(all_found), label)
+                    notes += nts2
+                    f_all.update(f_ns)
+                    n_nosite = len(f_ns)
+            if (not g["tags"]) or (goal_g and len(f_all) < goal_g) or len(f_all) < 30:
+                f_web = discover_web([g["q"]], locations, country, g["kws"], goal_g, status, 120,
+                                     set(f_all) | set(all_found), label)
+                f_all.update(f_web)
+                n_web = len(f_web)
+            for k, v in f_all.items():
+                v["group"] = g["label"] or g["q"]
+                if v["src"] == "Web search":
+                    v["states"] = want_states
+                all_found.setdefault(k, v)
+            stat_lines.append(f"{label}: {len(f_all)} mili (website wali {n_site}, bina website {n_nosite}, web search {n_web})")
 
-        if not found:
-            st.error("Koi website nahi mili. " + " | ".join(notes) + " Niche ya location saaf likh kar dobara try karo, ya 2-3 minute baad dobara.")
+        if not all_found:
+            st.error("Koi company nahi mili. " + " | ".join(notes) + " Niche ya location saaf likh kar dobara try karo, ya 2-3 minute baad dobara.")
             st.stop()
 
-        items = [dict(url=d, **v) for d, v in found.items()]
-        items = items[:(goal or HARD_CAP)]
+        items = [dict(url=k, **v) for k, v in all_found.items()][:HARD_CAP]
 
         infos = {}
         if filters_on:
@@ -1136,11 +1323,20 @@ with tab_search:
                     row["Source link"] = info["link"]
                     row["Confidence"] = info["confidence"]
             res["rows"].sort(key=lambda r: r["_score"], reverse=True)
-            if target:
-                res["rows"] = res["rows"][:target]
+            if per_group:
+                kept_rows, cnt = [], {}
+                for r in res["rows"]:
+                    k = r.get("Niche", "")
+                    if cnt.get(k, 0) < per_group:
+                        kept_rows.append(r)
+                        cnt[k] = cnt.get(k, 0) + 1
+                res["rows"] = kept_rows
             res["notes"] = notes
-            res["stats"] = (f"OpenStreetMap se {n_osm} + web search se {n_web} websites mili | "
-                            f"{len(res['rows'])} companies ka data tayyar")
+            final_counts = {}
+            for r in res["rows"]:
+                final_counts[r.get("Niche", "")] = final_counts.get(r.get("Niche", ""), 0) + 1
+            res["stats"] = ("Search: " + " | ".join(stat_lines) + " || Final CSV: "
+                            + ", ".join(f"{k or 'sab'}: {v}" for k, v in final_counts.items()))
             st.session_state["res"] = res
             status.write("Mukammal!")
 
