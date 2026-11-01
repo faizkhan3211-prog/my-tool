@@ -392,6 +392,45 @@ def detect_filters(desc):
     return emp_min, emp_max, rev_min, rev_max
 
 
+def get_secret(name, default=""):
+    try:
+        return str(st.secrets[name]).strip()
+    except Exception:
+        return default
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def ai_parse(desc, api_key, models):
+    prompt = (
+        "Extract lead-search settings from this client description. "
+        "Reply with ONLY JSON in this shape: "
+        '{"queries": ["up to 5 web search queries that find company websites"], '
+        '"emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
+        "Use 0 when not mentioned. Revenue is in millions of USD.\n\nDescription: " + desc
+    )
+    last = "koi model try nahi hua"
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(
+                url,
+                headers={"x-goog-api-key": api_key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"responseMimeType": "application/json"},
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                last = f"{model}: HTTP {r.status_code} {r.text[:160]}"
+                continue
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text), ""
+        except Exception as e:
+            last = f"{model}: {e}"
+    return None, last
+
+
 def discover(queries, per_query=20):
     found = {}
     if DDGS is None:
@@ -572,37 +611,7 @@ def read_sites_csv(up):
         return df0, False
     up.seek(0)
     return pd.read_csv(up, dtype=str), True
-def get_secret(name, default=""):
-    try:
-        return st.secrets[name]
-    except Exception:
-        return default
 
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def ai_parse(desc, api_key, model):
-    prompt = (
-        "Extract lead-search settings from this client description. "
-        "Reply with ONLY JSON in this shape: "
-        '{"queries": ["up to 5 web search queries that find company websites"], '
-        '"emp_min": 0, "emp_max": 0, "rev_min_m": 0, "rev_max_m": 0}. '
-        "Use 0 when not mentioned. Revenue is in millions of USD.\n\nDescription: " + desc
-    )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    try:
-        r = requests.post(
-            url,
-            headers={"x-goog-api-key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json"},
-            },
-            timeout=30,
-        )
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
-    except Exception:
-        return None
 
 # ---------- UI ----------
 tab_single, tab_bulk, tab_search = st.tabs(["Single website", "Bulk mode", "Client description search"])
@@ -651,7 +660,7 @@ with tab_bulk:
             st.session_state["res"] = run_batch(items, search_b, opts)
 
 with tab_search:
-    st.write("Client ki description likho. Tool khud companies dhoondega, aur description mein employees ya revenue likha ho to usay filter bana lega.")
+    st.write("Client ki description likho. AI (agar key lagi ho) ya simple rules description samajh kar companies dhoondte hain.")
     desc = st.text_area("Client description", height=110,
                         placeholder="Med spas in NYC and Brooklyn, 10-50 employees, revenue $1M-$5M")
     want_s = st.multiselect("Kya nikalna hai", WANT_ALL, default=["Company profile", "Emails", "Phones", "Social profiles"], key="want_s")
@@ -668,25 +677,38 @@ with tab_search:
         man_rev_min = m3.number_input("Min revenue, $M", min_value=0.0, value=0.0, step=0.5)
         man_rev_max = m4.number_input("Max revenue, $M", min_value=0.0, value=0.0, step=0.5)
 
+    ai_queries = []
+    q_clean = ""
+    d_emp_min = d_emp_max = 0
+    d_rev_min = d_rev_max = 0.0
+
     if desc.strip():
         d_emp_min, d_emp_max, d_rev_min, d_rev_max = detect_filters(desc)
+        q_clean = clean_description(desc)
+
+        api_key = get_secret("GEMINI_API_KEY")
+        if api_key:
+            wanted = [get_secret("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"]
+            models = tuple(m for m in dict.fromkeys(wanted) if m)
+            ai, err = ai_parse(desc, api_key, models)
+            if ai:
+                ai_queries = [str(q) for q in ai.get("queries", [])][:5]
+                d_emp_min = int(ai.get("emp_min", 0) or 0)
+                d_emp_max = int(ai.get("emp_max", 0) or 0)
+                d_rev_min = float(ai.get("rev_min_m", 0) or 0)
+                d_rev_max = float(ai.get("rev_max_m", 0) or 0)
+                st.success("AI ne description samjhi. Queries: " + " | ".join(ai_queries))
+            else:
+                st.warning("AI call fail hui, purane rules use ho rahe hain. Wajah: " + err)
+        else:
+            st.info("AI off hai (Secrets mein GEMINI_API_KEY nahi mili). Simple rules use ho rahe hain.")
+
         if man_emp_min or man_emp_max:
             d_emp_min, d_emp_max = man_emp_min, man_emp_max
         if man_rev_min or man_rev_max:
             d_rev_min, d_rev_max = man_rev_min, man_rev_max
-        q_clean = clean_description(desc)        ai = None
-        if get_secret("GEMINI_API_KEY") and get_secret("GEMINI_MODEL"):
-            ai = ai_parse(desc, get_secret("GEMINI_API_KEY"), get_secret("GEMINI_MODEL"))
-        if ai:
-            ai_queries = [str(q) for q in ai.get("queries", [])][:5]
-            if not (man_emp_min or man_emp_max):
-                d_emp_min = int(ai.get("emp_min", 0) or 0)
-                d_emp_max = int(ai.get("emp_max", 0) or 0)
-            if not (man_rev_min or man_rev_max):
-                d_rev_min = float(ai.get("rev_min_m", 0) or 0)
-                d_rev_max = float(ai.get("rev_max_m", 0) or 0)
-            st.success("AI ne description samjhi. Queries: " + " | ".join(ai_queries))
-        st.caption(f"Search query: **{q_clean}** | Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}")
+
+        st.caption(f"Employees: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}")
 
     if st.button("Dhoondo", key="search_btn") and desc.strip():
         filters_on = bool(d_emp_min or d_emp_max or d_rev_min or d_rev_max)
@@ -699,12 +721,11 @@ with tab_search:
         status = st.empty()
         bar = st.progress(0.0)
         status.write("Step 1: companies ki list ban rahi hai...")
-        base_q = q_clean
-        queries = []
+        queries = list(ai_queries)
+        base_q = q_clean or desc.strip()
         for q in (base_q, f"best {base_q}", f"top {base_q}", f"{base_q} contact us", f"{base_q} services"):
             if q not in queries:
-                queries.append(q)        if ai_queries:
-            queries = ai_queries + queries
+                queries.append(q)
         found = discover(queries)
         domains = list(found.keys())[:max_cand]
         if not domains:
