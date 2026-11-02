@@ -171,38 +171,49 @@ def fetch_html(url: str):
 
 
 # ============================================================
-# SEARCH (PYTHON ONLY)
+# SEARCH (PYTHON ONLY) - MULTI-QUERY + PAGINATION
 # ============================================================
 
-def search_web(query: str, max_results: int = 20, page: int = 1, region: str = "us-en"):
+def search_web(query: str, max_results: int = 25, page: int = 1, region: str = "us-en"):
+    """Search public web results with DDGS; retry auto backend if selected engines fail."""
     if not DDGS_AVAILABLE:
-        return [], f"The ddgs package is not available: {DDGS_IMPORT_ERROR}"
-    try:
-        results = DDGS(timeout=15).text(
-            query=query,
-            region=region,
-            safesearch="moderate",
-            max_results=max_results,
-            page=page,
-            backend="auto",
-        )
-        rows = []
-        for item in results:
-            rows.append({
-                "title": item.get("title", ""),
-                "url": item.get("href", ""),
-                "snippet": item.get("body", ""),
-                "query": query,
-            })
-        return rows, ""
-    except Exception as exc:
-        return [], str(exc)
+        return [], f"The ddgs package is unavailable: {DDGS_IMPORT_ERROR}"
+
+    backends_to_try = ["google,bing,brave,duckduckgo", "auto"]
+    last_error = "No search results returned."
+
+    for backend in backends_to_try:
+        try:
+            results = DDGS(timeout=20).text(
+                query=query,
+                region=region,
+                safesearch="moderate",
+                max_results=max_results,
+                page=page,
+                backend=backend,
+            )
+            rows = []
+            for item in results or []:
+                rows.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("href", ""),
+                    "snippet": item.get("body", ""),
+                    "query": query,
+                })
+            if rows:
+                return rows, ""
+            last_error = f"No results from backend {backend}."
+        except Exception as exc:
+            last_error = str(exc)
+
+    return [], last_error
 
 
 def region_code(location: str) -> str:
     text = (location or "").lower()
     mapping = {
-        "united states": "us-en", "usa": "us-en", " u.s. ": "us-en",
+        "united states": "us-en", "usa": "us-en", "u.s.": "us-en",
+        "new york": "us-en", "nyc": "us-en", "ny": "us-en",
         "united kingdom": "uk-en", "uk": "uk-en", "britain": "uk-en",
         "canada": "ca-en", "australia": "au-en", "new zealand": "nz-en",
         "pakistan": "pk-en", "india": "in-en", "germany": "de-de",
@@ -215,97 +226,151 @@ def region_code(location: str) -> str:
     return "us-en"
 
 
+def infer_location_from_text(text: str, override: str = "") -> str:
+    if (override or "").strip():
+        return override.strip()
+    raw = (text or "").lower()
+    aliases = [
+        (r"\bnyc\b|\bnew york city\b", "New York City, NY"),
+        (r"\bnew york\b|\bny\b", "New York, NY"),
+        (r"\blos angeles\b|\bla\b", "Los Angeles, CA"),
+        (r"\bsan francisco\b|\bsf\b", "San Francisco, CA"),
+        (r"\bchicago\b", "Chicago, IL"),
+        (r"\bhouston\b", "Houston, TX"),
+        (r"\bdallas\b", "Dallas, TX"),
+        (r"\bmiami\b", "Miami, FL"),
+        (r"\bflorida\b", "Florida, USA"),
+        (r"\btexas\b", "Texas, USA"),
+        (r"\bcalifornia\b", "California, USA"),
+        (r"\bunited states\b|\busa\b|\bu\.s\.\b", "United States"),
+        (r"\bunited kingdom\b|\buk\b", "United Kingdom"),
+        (r"\bcanada\b", "Canada"),
+        (r"\baustralia\b", "Australia"),
+        (r"\bpakistan\b", "Pakistan"),
+    ]
+    for pattern, location in aliases:
+        if re.search(pattern, raw):
+            return location
+    return ""
+
+
+def infer_industry_profile(instructions: str) -> dict:
+    text = (instructions or "").lower()
+    if re.search(r"\bdentist\w*\b|\bdental\b|\bdentistry\b|\borthodont", text):
+        return {
+            "kind": "dental_practice",
+            "label": "dental practices and dentist offices",
+            "positive_terms": [
+                "dentist", "dentists", "dental", "dentistry", "orthodont",
+                "periodont", "endodont", "oral surgery", "family dentistry",
+            ],
+            "exclude_terms": [
+                "dental insurance company", "dental insurance provider",
+                "dental insurance plans", "dental insurance carrier",
+                "dental benefits administrator", "dental benefits provider",
+                "insurance company", "insurance carrier", "insurance provider",
+                "dental plan administrator", "dental supplies",
+                "dental equipment manufacturer", "dental laboratory", "dental lab supplier",
+                "jobs at", "dental school", "dental association", "provider network",
+                "insurance network", "dental insurance carrier",
+            ],
+            "queries": [
+                'dentist offices {loc} official website',
+                'dental practices {loc} dentist office',
+                'family dentistry {loc} dental practice',
+                'general dentist {loc} practice website',
+                'cosmetic dentist {loc} dental office',
+                'dental clinic {loc} "contact us"',
+                'dentists {loc} "our team"',
+                'dental group {loc} dental practice locations',
+                'dentist {loc} local dental practice website',
+                'general dentistry {loc} official website',
+                'pediatric dentist {loc} office website',
+                'orthodontist {loc} practice website',
+            ],
+        }
+    # Generic industry: strip quantities and command words before searching.
+    cleaned = re.sub(r"\b\d+\s*(?:companies|businesses|company|business|results|leads|records)\b", " ", text)
+    cleaned = re.sub(r"\b(?:only|find|search|research|get me|i need|need|looking for|please|companies|businesses)\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    return {
+        "kind": "generic",
+        "label": cleaned or "companies",
+        "positive_terms": [],
+        "exclude_terms": [],
+        "queries": [],
+    }
+
+
+def clean_instruction_for_search(instructions: str) -> str:
+    text = re.sub(r"\s+", " ", (instructions or "")).strip()
+    text = re.sub(
+        r"\b\d+\s*(?:companies|businesses|company|business|results|leads|records)\b",
+        " ", text, flags=re.I
+    )
+    text = re.sub(
+        r"\b(?:only|please|find me|find|search for|search|research|get me|i need|need|looking for|want|give me)\b",
+        " ", text, flags=re.I
+    )
+    return re.sub(r"\s+", " ", text).strip(" ,.-")
+
+
 def direct_search_queries(instructions: str, location: str = ""):
-    """Turn direct instructions into search phrases without an AI call."""
-    brief = re.sub(r"\s+", " ", instructions).strip()
-    loc = (location or "").strip()
+    """Expand a short client instruction into several search-engine queries; no AI call."""
+    profile = infer_industry_profile(instructions)
+    detected_location = infer_location_from_text(instructions, location)
+    loc = detected_location or location or ""
     queries = []
 
-    # User-entered separate lines are treated as separate search queries.
-    for line in instructions.splitlines():
-        line = line.strip(" \t-•")
-        if len(line) > 8:
-            queries.append(line)
+    if profile["kind"] == "dental_practice":
+        for template in profile["queries"]:
+            query = template.format(loc=loc).strip()
+            if not loc:
+                query = query.replace("  ", " ").strip()
+            queries.append(query)
+        # Add broader discovery queries without quantity words like "50 only".
+        queries.extend([
+            f'dentist {loc} dental office official website'.strip(),
+            f'dental practice {loc} office locations'.strip(),
+            f'family dentist {loc} contact website'.strip(),
+        ])
+    else:
+        base = clean_instruction_for_search(instructions)
+        if loc and loc.lower() not in base.lower():
+            base = f"{base} {loc}".strip()
+        queries.extend([
+            f'"{base}" company official website',
+            f'"{base}" businesses company websites',
+            f'"{base}" companies in {loc} official website'.strip(),
+            f'{base} business directory company website'.strip(),
+            f'{base} local businesses official sites'.strip(),
+        ])
 
-    if loc and loc.lower() not in brief.lower():
-        queries.append(f"{brief} {loc}")
-
-    queries.extend([
-        f"{brief} companies official website",
-        f"{brief} businesses company websites",
-        f"{brief} company directory business websites",
-    ])
-
-    unique = []
-    seen = set()
+    unique, seen = [], set()
     for query in queries:
-        normalized = query.casefold()
-        if query and normalized not in seen:
-            seen.add(normalized)
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query.casefold() not in seen:
+            seen.add(query.casefold())
             unique.append(query)
-    return unique or [brief]
+    return unique
 
 
-def collect_company_candidates(queries, requested_count, location=""):
-    """Paginate search queries until requested company count is reached or results end."""
-    region = region_code(location)
-    candidates = []
-    seen_domains = set()
-    all_search_results = []
-    errors = []
+DIRECTORY_DOMAINS = {
+    "yelp.com", "yellowpages.com", "bbb.org", "mapquest.com",
+    "manta.com", "chamberofcommerce.com", "threebestrated.com",
+    "healthgrades.com", "zocdoc.com", "webmd.com", "vitals.com",
+    "carecredit.com", "dentalplans.com", "dentistry.com",
+    "opencare.com", "1800dentist.com", "dentaldepartures.com",
+    "healthprofs.com", "ratemds.com", "doctor.com", "superpages.com",
+    "angi.com", "thumbtack.com", "expertise.com", "yellowbook.com",
+}
 
-    progress = st.progress(0, text="Searching the web for company websites...")
-    status = st.empty()
-
-    for query_index, query in enumerate(queries, start=1):
-        page = 1
-        while len(candidates) < requested_count:
-            status.write(f"Search {query_index}/{len(queries)} · page {page}: {query[:100]}")
-            results, error = search_web(
-                query,
-                max_results=20,
-                page=page,
-                region=region,
-            )
-            if error:
-                errors.append(f"{query}: {error}")
-                break
-            if not results:
-                break
-            all_search_results.extend(results)
-
-            for item in results:
-                url = item.get("url", "")
-                if not is_candidate_company_url(url):
-                    continue
-                domain = (urlsplit(url).hostname or "").lower().removeprefix("www.")
-                if not domain or domain in seen_domains:
-                    continue
-                seen_domains.add(domain)
-                candidates.append({
-                    "domain": domain,
-                    "website": root_url(url),
-                    "search_result": item,
-                })
-                if len(candidates) >= requested_count:
-                    break
-
-            progress.progress(
-                min(1.0, len(candidates) / requested_count),
-                text=f"Found {len(candidates)} of {requested_count} requested companies...",
-            )
-
-            # No more result pages for this query when the backend returns a short page.
-            if len(results) < 20:
-                break
-            page += 1
-
-        if len(candidates) >= requested_count:
-            break
-
-    status.empty()
-    progress.empty()
-    return candidates[:requested_count], all_search_results, errors
+DENTAL_INSURER_DOMAINS = {
+    "unitedconcordia.com", "deltadental.com", "deltadentalins.com",
+    "dentalplans.com", "careington.com", "dentalbenefits.com",
+    "ameritas.com", "guardianlife.com", "metlife.com", "cigna.com",
+    "humana.com", "aetna.com", "uhc.com",
+}
 
 
 def is_candidate_company_url(url: str) -> bool:
@@ -314,7 +379,9 @@ def is_candidate_company_url(url: str) -> bool:
         host = (parsed.hostname or "").lower().removeprefix("www.")
         if not host or "." not in host:
             return False
-        if any(host == blocked or host.endswith("." + blocked) for blocked in SKIP_DOMAINS):
+        if any(host == bad or host.endswith("." + bad) for bad in SKIP_DOMAINS):
+            return False
+        if any(host == bad or host.endswith("." + bad) for bad in DIRECTORY_DOMAINS):
             return False
         if host.endswith((".gov", ".edu")):
             return False
@@ -325,8 +392,119 @@ def is_candidate_company_url(url: str) -> bool:
         return False
 
 
+def is_relevant_search_result(item: dict, profile: dict) -> bool:
+    text = " ".join([
+        str(item.get("title", "")),
+        str(item.get("snippet", "")),
+        str(item.get("url", "")),
+    ]).lower()
+    if profile.get("kind") == "dental_practice":
+        if not any(term in text for term in profile["positive_terms"]):
+            return False
+        if any(term in text for term in profile["exclude_terms"]):
+            return False
+        # Avoid insurance and supply companies even when they mention dentistry.
+        has_clinic_signal = re.search(
+            r"\b(dentist|dental office|dental practice|dental clinic|dentistry|patient appointments|family dentistry|cosmetic dentistry)\b",
+            text,
+        )
+        has_insurer_signal = re.search(
+            r"\b(insurance company|insurance carrier|insurance provider|dental insurer|benefits administrator|dental plan administrator|dental supplies|equipment manufacturer|dental laboratory|dental lab supplier|group dental plans|member dental benefits|dental claims administration)\b",
+            text,
+        )
+        if has_insurer_signal and not has_clinic_signal:
+            return False
+    # Filter search-result fragments / Markdown separator rows.
+    title = str(item.get("title", "")).strip()
+    if re.fullmatch(r"[|\-_=:\s]+", title or ""):
+        return False
+    return True
+
+
+def collect_company_candidates(queries, requested_count, location="", profile=None):
+    """Search many targeted queries and pages, deduplicating actual company domains."""
+    profile = profile or {"kind": "generic", "positive_terms": [], "exclude_terms": []}
+    region = region_code(location)
+    candidates = []
+    seen_domains = set()
+    all_search_results = []
+    errors = []
+
+    candidate_target = max(requested_count * 3, requested_count + 30)
+    progress = st.progress(0, text="Searching multiple query variations...")
+    status = st.empty()
+    step = 0
+
+    # Search up to four result pages per query. Do not stop just because the
+    # provider returned fewer than 20 rows: some engines cap a page at 10-15.
+    for query_index, query in enumerate(queries, start=1):
+        for page in range(1, 5):
+            if len(candidates) >= candidate_target:
+                break
+
+            step += 1
+            status.write(
+                f"Search {query_index}/{len(queries)} · page {page}: {query[:95]}"
+            )
+
+            results, error = search_web(
+                query,
+                max_results=25,
+                page=page,
+                region=region,
+            )
+
+            if error:
+                errors.append(f"{query} (page {page}): {error}")
+                # Continue to the next query instead of abandoning the entire run.
+                break
+
+            if not results:
+                break
+
+            all_search_results.extend(results)
+
+            for item in results:
+                url = item.get("url", "")
+                if not is_candidate_company_url(url):
+                    continue
+                if not is_relevant_search_result(item, profile):
+                    continue
+
+                domain = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+                if profile.get("kind") == "dental_practice" and any(
+                    domain == bad or domain.endswith("." + bad)
+                    for bad in DENTAL_INSURER_DOMAINS
+                ):
+                    continue
+                if not domain or domain in seen_domains:
+                    continue
+
+                seen_domains.add(domain)
+                candidates.append({
+                    "domain": domain,
+                    "website": root_url(url),
+                    "search_result": item,
+                })
+
+                if len(candidates) >= candidate_target:
+                    break
+
+            progress.progress(
+                min(1.0, len(candidates) / max(1, candidate_target)),
+                text=f"Collected {len(candidates)} candidate websites; target after verification is {requested_count}...",
+            )
+
+        if len(candidates) >= candidate_target:
+            break
+
+    status.empty()
+    progress.empty()
+    return candidates[:candidate_target], all_search_results, errors
+
+
 # ============================================================
-# COMPANY NAME, SOCIALS, REVENUE EXTRACTION
+# COMPANY NAME AND SOCIAL LINKS
 # ============================================================
 
 def extract_org_name_from_jsonld(soup):
@@ -375,26 +553,6 @@ def classify_social(url: str):
     return ""
 
 
-def extract_revenue(text: str) -> str:
-    if not text:
-        return "Not publicly found"
-
-    # Keep revenue extraction conservative; never estimate a company's revenue.
-    money = r"(?:(?:US\$|USD|EUR|GBP|\$|€|£)\s*)?\d[\d,.]*(?:\s*(?:billion|million|thousand|bn|mn|m|k))?"
-    patterns = [
-        rf"(?:annual\s+)?(?:revenue|turnover|sales)\s*(?:of|is|was|:|=|approximately|around)?\s*({money})",
-        rf"({money})\s*(?:in\s+)?(?:annual\s+)?(?:revenue|turnover|sales)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I)
-        if match:
-            value = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;-")
-            if value and not value.endswith("%"):
-                return value
-    return "Not publicly found"
-
-
 def extract_page_data(url: str):
     html, final_url, status, content_type = fetch_html(url)
     if html is None:
@@ -420,15 +578,18 @@ def extract_page_data(url: str):
         if app_name:
             org_name = app_name.get("content", "").strip()
 
-    socials = {}
-    for label in ["LinkedIn", "Facebook", "Instagram", "X / Twitter", "Other Socials"]:
-        socials[label] = ""
+    socials = {label: "" for label in [
+        "LinkedIn", "Facebook", "Instagram", "X / Twitter", "Other Socials"
+    ]}
 
     for anchor in soup.find_all("a", href=True):
         href = urljoin(final_url, anchor["href"].strip()).split("#", 1)[0]
         social_type = classify_social(href)
-        if social_type and not socials[social_type]:
-            socials[social_type] = href
+        # Accept links found on the company's own site, not generic share links.
+        if social_type and not socials.get(social_type):
+            low = href.lower()
+            if not any(word in low for word in ("share", "intent/tweet", "sharer", "login")):
+                socials[social_type] = href
 
     current_domain = (urlsplit(final_url).hostname or "").lower()
     internal_links = []
@@ -461,29 +622,51 @@ def extract_page_data(url: str):
     }
 
 
-def research_one_company(candidate: dict):
+def research_one_company(candidate: dict, profile: dict = None):
+    """Research one candidate's own site without calling Gemini."""
     website = candidate["website"]
     domain = candidate["domain"]
+    profile = profile or {"kind": "generic", "positive_terms": [], "exclude_terms": []}
     pages = []
     errors = []
 
-    # No user-facing pages-per-company control. Automatically check the homepage
-    # and a few relevant internal pages when available.
-    urls_to_check = [website]
     try:
         first = extract_page_data(website)
         pages.append(first)
-        for link in first.get("internal_links", []):
-            if link not in urls_to_check:
-                urls_to_check.append(link)
-        for link in urls_to_check[1:4]:
+        # Automatically inspect homepage plus up to three relevant internal pages.
+        links = first.get("internal_links", [])
+        for link in links[:3]:
             try:
                 pages.append(extract_page_data(link))
-                time.sleep(0.15)
+                time.sleep(0.12)
             except Exception as exc:
                 errors.append(str(exc))
     except Exception as exc:
         errors.append(str(exc))
+
+    all_text = " ".join(
+        str(page.get("title", "")) + " " +
+        str(page.get("description", "")) + " " +
+        str(page.get("text", ""))
+        for page in pages
+    ).lower()
+
+    # Require real on-site industry evidence for dental searches.
+    if profile.get("kind") == "dental_practice":
+        if not any(term in all_text for term in profile["positive_terms"]):
+            return None
+        if any(term in all_text for term in profile["exclude_terms"]):
+            return None
+        has_clinic_signal = re.search(
+            r"\b(dentist|dental office|dental practice|dental clinic|dentistry|patient appointments|family dentistry|cosmetic dentistry)\b",
+            all_text,
+        )
+        has_insurer_signal = re.search(
+            r"\b(insurance company|insurance carrier|insurance provider|dental insurer|benefits administrator|dental plan administrator|dental supplies|equipment manufacturer|dental laboratory|dental lab supplier|group dental plans|member dental benefits|dental claims administration)\b",
+            all_text,
+        )
+        if has_insurer_signal and not has_clinic_signal:
+            return None
 
     company_name = ""
     for page in pages:
@@ -497,62 +680,32 @@ def research_one_company(candidate: dict):
                 break
     company_name = clean_company_name(company_name, domain)
 
-    socials = {label: "" for label in ["LinkedIn", "Facebook", "Instagram", "X / Twitter", "Other Socials"]}
-    all_text = []
+    # Reject obvious non-company / separator fragments.
+    if re.fullmatch(r"[|\-_=:\s]+", company_name or ""):
+        return None
+    if company_name.lower() in {"home", "homepage", "welcome", "official website"}:
+        company_name = domain.split(".")[0].replace("-", " ").title()
+
+    socials = {label: "" for label in [
+        "LinkedIn", "Facebook", "Instagram", "X / Twitter", "Other Socials"
+    ]}
     for page in pages:
-        all_text.append(page.get("text", ""))
-        for label, url in page.get("socials", {}).items():
-            if url and not socials.get(label):
-                socials[label] = url
+        for label, link in page.get("socials", {}).items():
+            if link and not socials.get(label):
+                socials[label] = link
 
-    # One Python search pass per company to look for publicly reported revenue
-    # and official social-profile links. No Gemini request is made here.
-    extra_results, search_error = search_web(
-        f'"{company_name}" "{domain}" (revenue OR turnover OR annual sales OR LinkedIn OR Facebook OR Instagram)',
-        max_results=8,
-        page=1,
-        region="us-en",
-    )
-    if search_error:
-        errors.append(search_error)
-
-    revenue_text = " ".join(all_text)
-    revenue_candidates = [revenue_text]
-    for result in extra_results:
-        revenue_candidates.append(result.get("snippet", ""))
-        revenue_candidates.append(result.get("title", ""))
-
-        result_url = result.get("url", "")
-        social_type = classify_social(result_url)
-        if social_type and not socials.get(social_type):
-            title_and_snippet = (
-                result.get("title", "") + " " + result.get("snippet", "")
-            ).lower()
-            if company_name.lower() in title_and_snippet or domain.lower() in title_and_snippet:
-                socials[social_type] = result_url
-
-    revenue = "Not publicly found"
-    for evidence in revenue_candidates:
-        found = extract_revenue(evidence)
-        if found != "Not publicly found":
-            revenue = found
-            break
+    source_urls = [page.get("url", "") for page in pages if page.get("url")]
 
     return {
         "Company Name": company_name,
         "Website": website,
-        "Revenue": revenue,
         "LinkedIn": socials["LinkedIn"],
         "Facebook": socials["Facebook"],
         "Instagram": socials["Instagram"],
         "X / Twitter": socials["X / Twitter"],
         "Other Socials": socials["Other Socials"],
-        "Source Notes": " | ".join(
-            [page.get("url", "") for page in pages if page.get("url")]
-        ),
-        "Search Evidence": " | ".join(
-            [r.get("url", "") for r in extra_results if r.get("url")]
-        ),
+        "Source Notes": " | ".join(source_urls),
+        "Search Evidence": candidate.get("search_result", {}).get("url", ""),
         "Errors": " | ".join(errors),
     }
 
@@ -598,7 +751,7 @@ Return valid JSON only with:
 }}
 
 Keep every requirement faithful to the client's brief. Do not add unsupported
-company-size, industry, location, revenue, or job-title requirements.
+company-size, industry, location, or job-title requirements.
 The output is only a plan for Python. Do not invent any company or person.
 """
 
@@ -646,7 +799,7 @@ def show_gemini_error(exc):
 
 def display_company_results(rows, prefix):
     output_columns = [
-        "Company Name", "Website", "Revenue", "LinkedIn", "Facebook",
+        "Company Name", "Website", "LinkedIn", "Facebook",
         "Instagram", "X / Twitter", "Other Socials",
     ]
     evidence_columns = ["Source Notes", "Search Evidence", "Errors"]
@@ -656,13 +809,19 @@ def display_company_results(rows, prefix):
         if column not in df.columns:
             df[column] = ""
 
-    # Exactly one row per company/domain; output columns are spreadsheet-friendly.
-    if "Website" in df.columns:
-        df = df.drop_duplicates(subset=["Website"], keep="first")
+    # Clean copied Markdown artifacts and non-company separator rows.
+    df["Company Name"] = df["Company Name"].fillna("").astype(str).map(
+        lambda x: re.sub(r"\s+", " ", x.strip().strip("| "))
+    )
+    df["Website"] = df["Website"].fillna("").astype(str).str.strip()
+    df = df[~df["Company Name"].str.fullmatch(r"[|\-_=:\s]*", na=False)]
+    df = df[~df["Company Name"].str.lower().isin({"company name", "website", "---", "not publicly found"})]
+    df = df[df["Website"].str.match(r"^https?://", case=False, na=False)]
+    df = df.drop_duplicates(subset=["Website"], keep="first")
 
     display_df = df[output_columns].fillna("")
+    st.success(f"Found {len(display_df)} company website(s).")
 
-    st.success(f"Research complete: {len(display_df)} company row(s) found.")
     st.dataframe(
         display_df,
         use_container_width=True,
@@ -677,10 +836,9 @@ def display_company_results(rows, prefix):
         },
     )
 
-    csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "Download Excel-style CSV",
-        csv_data,
+        "Download CSV",
+        display_df.to_csv(index=False).encode("utf-8-sig"),
         f"{prefix}_companies.csv",
         "text/csv",
         use_container_width=True,
@@ -690,7 +848,7 @@ def display_company_results(rows, prefix):
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         display_df.to_excel(writer, index=False, sheet_name="Companies")
     st.download_button(
-        "Download Excel file",
+        "Download Excel",
         excel_buffer.getvalue(),
         f"{prefix}_companies.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -712,7 +870,7 @@ def display_company_results(rows, prefix):
 def bulk_extractor_page():
     st.markdown(
         '<div class="hero"><h1>Bulk Website Extractor</h1>'
-        '<p>Paste website URLs. Python extracts company name, website, revenue mentions and social links. No AI is used.</p></div>',
+        '<p>Paste website URLs. Python extracts company name, website and official social links. No AI is used.</p></div>',
         unsafe_allow_html=True,
     )
 
@@ -763,8 +921,7 @@ def bulk_extractor_page():
                 rows.append({
                     "Company Name": domain,
                     "Website": root_url(url),
-                    "Revenue": "Not publicly found",
-                    "LinkedIn": "", "Facebook": "", "Instagram": "",
+                            "LinkedIn": "", "Facebook": "", "Instagram": "",
                     "X / Twitter": "", "Other Socials": "",
                     "Source Notes": root_url(url),
                     "Search Evidence": "",
@@ -801,7 +958,7 @@ def ai_company_research_page():
         height=190,
         placeholder=(
             "Example: Find 80 US-based electrical contractors in Texas and Florida. "
-            "I need company name, official website, annual revenue and LinkedIn/Facebook/Instagram links."
+            "I need company name, official website and LinkedIn/Facebook/Instagram links."
         ),
         key="research_instructions",
     )
@@ -857,6 +1014,8 @@ def ai_company_research_page():
             return
 
         count = int(requested_count)
+        detected_location = infer_location_from_text(instructions, location)
+        profile = infer_industry_profile(instructions)
         queries = []
         plan = None
 
@@ -873,20 +1032,25 @@ def ai_company_research_page():
                         instructions,
                         location,
                     )
-                queries = [str(q).strip() for q in plan.get("search_queries", []) if str(q).strip()]
-                if location and not any(location.lower() in q.lower() for q in queries):
-                    queries = [f"{q} {location}" for q in queries]
-                if not queries:
-                    queries = direct_search_queries(instructions, location)
+                ai_queries = [str(q).strip() for q in plan.get("search_queries", []) if str(q).strip()]
+                # Always add deterministic industry/location queries. This prevents
+                # a vague AI query from limiting a simple request such as "dentist NY".
+                deterministic_queries = direct_search_queries(instructions, detected_location)
+                queries = ai_queries + deterministic_queries
+                queries = list(dict.fromkeys(q for q in queries if q))
                 st.session_state["last_brief_plan"] = plan
             except Exception as exc:
                 show_gemini_error(exc)
                 return
         else:
-            queries = direct_search_queries(instructions, location)
+            queries = direct_search_queries(instructions, detected_location)
             st.session_state["last_brief_plan"] = None
 
         st.write(f"**Search mode:** {mode}")
+        if detected_location:
+            st.caption(f"Detected target location: {detected_location}")
+        if profile.get("kind") == "dental_practice":
+            st.caption("Dental search includes dental offices, dental practices, family/general dentists and clinics. Dental insurers, suppliers and directories are filtered out.")
         if plan:
             with st.expander("Gemini's brief breakdown", expanded=True):
                 st.write(plan.get("brief_summary", ""))
@@ -903,7 +1067,8 @@ def ai_company_research_page():
         candidates, search_results, errors = collect_company_candidates(
             queries,
             count,
-            location,
+            detected_location,
+            profile=profile,
         )
 
         if not candidates:
@@ -921,18 +1086,24 @@ def ai_company_research_page():
             status.write(f"Researching company {index} of {len(candidates)}: {candidate['domain']}")
             progress.progress((index - 1) / len(candidates), text=f"Researching {candidate['domain']}")
             try:
-                company_rows.append(research_one_company(candidate))
+                row = research_one_company(candidate, profile=profile)
+                if row is not None:
+                    company_rows.append(row)
             except Exception as exc:
-                company_rows.append({
-                    "Company Name": candidate["domain"],
-                    "Website": candidate["website"],
-                    "Revenue": "Not publicly found",
-                    "LinkedIn": "", "Facebook": "", "Instagram": "",
-                    "X / Twitter": "", "Other Socials": "",
-                    "Source Notes": candidate["website"],
-                    "Search Evidence": candidate["search_result"].get("url", ""),
-                    "Errors": str(exc),
-                })
+                # Only keep an inaccessible-site fallback for general searches.
+                # For dental targeting, a site must be checked for dental-practice evidence.
+                if profile.get("kind") != "dental_practice":
+                    company_rows.append({
+                        "Company Name": candidate["domain"],
+                        "Website": candidate["website"],
+                        "LinkedIn": "", "Facebook": "", "Instagram": "",
+                        "X / Twitter": "", "Other Socials": "",
+                        "Source Notes": candidate["website"],
+                        "Search Evidence": candidate["search_result"].get("url", ""),
+                        "Errors": str(exc),
+                    })
+            if len(company_rows) >= count:
+                break
             time.sleep(0.15)
 
         progress.progress(1.0, text="Company research completed")
@@ -946,8 +1117,8 @@ def ai_company_research_page():
 
         if len(company_rows) < count:
             st.warning(
-                f"Search found {len(company_rows)} suitable company websites out of {count} requested. "
-                "The tool does not invent companies to fill the target. Try broader search wording if you need more."
+                f"The search discovered {len(company_rows)} verified, relevant company websites out of {count} requested. "
+                "The search now checks multiple industry variations and result pages. If the target is still short, broaden the location or business type; the app will not add unrelated companies just to reach 50."
             )
 
     rows = st.session_state.get("research_company_rows", [])
@@ -982,8 +1153,7 @@ else:
 
 st.divider()
 st.caption(
-    "Revenue is shown only when a public source provides a detectable figure; otherwise it is marked Not publicly found. "
     "Social links are collected from official website links or matching search results. "
     "This app accesses public pages only and does not bypass logins, CAPTCHAs or paywalls. "
-    "Verify revenue and social profiles against their source before client delivery."
+    "Verify company details and social profiles against their source before client delivery."
 )
