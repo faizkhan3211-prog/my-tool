@@ -1,4 +1,3 @@
-import io
 import ipaddress
 import json
 import os
@@ -16,9 +15,9 @@ from google import genai
 from google.genai import types
 
 
-# =========================================================
-# APP CONFIGURATION
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
 st.set_page_config(
     page_title="Lead Research & Intelligence",
@@ -30,58 +29,56 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container {
-          padding-top: 1.5rem;
-          padding-bottom: 3rem;
-          max-width: 1500px;
-      }
-      [data-testid="stSidebar"] {
-          border-right: 1px solid rgba(128,128,128,.18);
-      }
-      .hero {
-          padding: 1.3rem 1.5rem;
-          border: 1px solid rgba(128,128,128,.22);
-          border-radius: 16px;
-          margin-bottom: 1.2rem;
-          background: linear-gradient(
-              120deg,
-              rgba(40,100,180,.12),
-              rgba(20,170,160,.08)
-          );
-      }
-      .hero h1 {
-          margin: 0 0 .35rem 0;
-          font-size: 1.9rem;
-      }
-      .hero p {
-          margin: 0;
-          opacity: .78;
-      }
-      div[data-testid="stMetric"] {
-          border: 1px solid rgba(128,128,128,.2);
-          padding: 12px 14px;
-          border-radius: 12px;
-      }
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
+    [data-testid="stSidebar"] {
+        border-right: 1px solid rgba(128,128,128,.18);
+    }
+    .hero {
+        padding: 1.25rem 1.5rem;
+        border: 1px solid rgba(128,128,128,.22);
+        border-radius: 16px;
+        margin-bottom: 1.2rem;
+        background: linear-gradient(
+            120deg,
+            rgba(40,100,180,.12),
+            rgba(20,170,160,.08)
+        );
+    }
+    .hero h1 {
+        margin: 0 0 .35rem 0;
+        font-size: 1.9rem;
+    }
+    .hero p {
+        margin: 0;
+        opacity: .78;
+    }
+    div[data-testid="stMetric"] {
+        border: 1px solid rgba(128,128,128,.2);
+        padding: 12px 14px;
+        border-radius: 12px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-APP_USER_AGENT = (
-    "LeadResearchStreamlit/1.0 "
-    "(public-page research; respectful request rate)"
-)
-
+USER_AGENT = "LeadResearchApp/1.1"
 REQUEST_TIMEOUT = 18
-MAX_RESPONSE_BYTES = 5 * 1024 * 1024
-MAX_WEBSITES_PER_RUN = 50
+MAX_PAGE_BYTES = 5 * 1024 * 1024
+MAX_WEBSITES = 30
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 
-# =========================================================
-# COMMON FUNCTIONS
-# =========================================================
+# ============================================================
+# WEBSITE EXTRACTION
+# ============================================================
 
-def normalize_url(raw_url: str) -> str:
+def normalize_url(raw_url):
+
     value = (raw_url or "").strip()
 
     if not value:
@@ -93,13 +90,13 @@ def normalize_url(raw_url: str) -> str:
     parsed = urlsplit(value)
 
     if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError("Only HTTP and HTTPS are supported.")
+        raise ValueError("Only HTTP/HTTPS URLs are supported.")
 
     if not parsed.hostname:
-        raise ValueError(f"Invalid website URL: {raw_url}")
+        raise ValueError("Invalid website URL.")
 
     if parsed.username or parsed.password:
-        raise ValueError("URLs containing credentials are not accepted.")
+        raise ValueError("URLs containing credentials are blocked.")
 
     if not parsed.path:
         parsed = parsed._replace(path="/")
@@ -107,54 +104,63 @@ def normalize_url(raw_url: str) -> str:
     return urlunsplit(parsed)
 
 
-def validate_public_url(url: str) -> None:
+def validate_public_url(url):
+
     parsed = urlsplit(url)
     host = parsed.hostname
 
     if parsed.scheme.lower() not in {"http", "https"} or not host:
-        raise ValueError("Only public HTTP/HTTPS destinations are allowed.")
+        raise ValueError("Invalid public website URL.")
 
     if (
         host.lower() in {"localhost", "localhost.localdomain"}
         or host.lower().endswith(".local")
     ):
-        raise ValueError("Local network addresses are blocked.")
+        raise ValueError("Local network URLs are blocked.")
 
     try:
+
         resolved = socket.getaddrinfo(
             host,
-            parsed.port or (443 if parsed.scheme == "https" else 80)
+            parsed.port or (
+                443 if parsed.scheme.lower() == "https" else 80
+            ),
+            type=socket.SOCK_STREAM,
         )
-    except (socket.gaierror, ValueError) as exc:
+
+    except (socket.gaierror, ValueError, OSError) as exc:
         raise ValueError(f"Could not resolve website: {exc}") from exc
 
     addresses = {item[4][0] for item in resolved}
 
     if not addresses:
-        raise ValueError("Website hostname did not resolve.")
+        raise ValueError("Website host did not resolve.")
 
     for address in addresses:
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
+
+        ip = ipaddress.ip_address(
+            address.split("%", 1)[0]
+        )
 
         if not ip.is_global:
-            raise ValueError(
-                "Private, reserved, or local network addresses are blocked."
-            )
+            raise ValueError("Private or local URLs are blocked.")
 
 
-def fetch_public_page(url: str):
-    current_url = url
+def fetch_html(url):
+
+    current = url
+
     redirect_codes = {301, 302, 303, 307, 308}
 
     for _ in range(6):
 
-        validate_public_url(current_url)
+        validate_public_url(current)
 
         response = requests.get(
-            current_url,
+            current,
             headers={
-                "User-Agent": APP_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml"
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml",
             },
             timeout=REQUEST_TIMEOUT,
             allow_redirects=False,
@@ -164,12 +170,13 @@ def fetch_public_page(url: str):
         if response.status_code in redirect_codes:
 
             location = response.headers.get("Location")
+
             response.close()
 
             if not location:
-                raise ValueError("Redirect destination is missing.")
+                raise ValueError("Missing redirect destination.")
 
-            current_url = urljoin(current_url, location)
+            current = urljoin(current, location)
             continue
 
         try:
@@ -181,29 +188,19 @@ def fetch_public_page(url: str):
             ).lower()
 
             if "html" not in content_type and "xhtml" not in content_type:
-
-                return (
-                    None,
-                    response.url,
-                    response.status_code,
-                    content_type
-                )
+                return None, response.url, response.status_code, content_type
 
             body = bytearray()
 
-            for chunk in response.iter_content(
-                chunk_size=65536
-            ):
+            for chunk in response.iter_content(chunk_size=65536):
 
                 if not chunk:
                     continue
 
                 body.extend(chunk)
 
-                if len(body) > MAX_RESPONSE_BYTES:
-                    raise ValueError(
-                        "Page exceeds the 5 MB safety limit."
-                    )
+                if len(body) > MAX_PAGE_BYTES:
+                    raise ValueError("Page exceeds the 5 MB limit.")
 
             encoding = response.encoding or "utf-8"
 
@@ -212,12 +209,7 @@ def fetch_public_page(url: str):
                 errors="replace"
             )
 
-            return (
-                html,
-                response.url,
-                response.status_code,
-                content_type
-            )
+            return html, response.url, response.status_code, content_type
 
         finally:
             response.close()
@@ -225,38 +217,99 @@ def fetch_public_page(url: str):
     raise ValueError("Too many redirects.")
 
 
-def extract_json_ld_contacts(soup):
+# ============================================================
+# STRUCTURED DATA EXTRACTION
+# ============================================================
+
+def walk_jsonld(node, found_people, emails, phones):
+
+    if isinstance(node, dict):
+
+        node_type = node.get("@type", "")
+
+        if isinstance(node_type, list):
+            types_found = {str(x).lower() for x in node_type}
+        else:
+            types_found = {str(node_type).lower()}
+
+        name = node.get("name")
+
+        job = (
+            node.get("jobTitle")
+            or node.get("jobtitle")
+            or ""
+        )
+
+        if name and ("person" in types_found or job):
+
+            found_people.append({
+
+                "Full Name": str(name).strip(),
+
+                "Job Title": str(job).strip(),
+
+                "Source URL": str(
+                    node.get("url")
+                    or node.get("sameAs")
+                    or ""
+                ).strip(),
+
+                "Evidence": "Person information found in website structured data.",
+
+            })
+
+        for key, value in node.items():
+
+            key_lower = str(key).lower()
+
+            if key_lower in {"email", "emailaddress"} and isinstance(value, str):
+                emails.add(value.replace("mailto:", "").strip())
+
+            elif key_lower in {"telephone", "phone"} and isinstance(value, str):
+                phones.add(value.strip())
+
+            walk_jsonld(
+                value,
+                found_people,
+                emails,
+                phones
+            )
+
+    elif isinstance(node, list):
+
+        for child in node:
+            walk_jsonld(child, found_people, emails, phones)
+
+
+# ============================================================
+# PAGE DATA EXTRACTION
+# ============================================================
+
+def extract_page(url):
+
+    html, final_url, status, content_type = fetch_html(url)
+
+    if html is None:
+
+        return {
+            "url": final_url,
+            "status": status,
+            "title": "",
+            "description": f"Non-HTML content: {content_type}",
+            "text": "",
+            "emails": set(),
+            "phones": set(),
+            "links": [],
+            "structured_people": [],
+        }
+
+    soup = BeautifulSoup(html, "html.parser")
 
     emails = set()
     phones = set()
+    structured_people = []
 
-    def walk(node):
-
-        if isinstance(node, dict):
-
-            for key, value in node.items():
-
-                key_l = str(key).lower()
-
-                if key_l in {"email", "emailaddress"}:
-
-                    if isinstance(value, str):
-                        emails.add(
-                            value.replace("mailto:", "").strip()
-                        )
-
-                elif key_l in {"telephone", "phone"}:
-
-                    if isinstance(value, str):
-                        phones.add(value.strip())
-
-                walk(value)
-
-        elif isinstance(node, list):
-
-            for child in node:
-                walk(child)
-
+    # JSON-LD data
     for script in soup.find_all(
         "script",
         attrs={"type": "application/ld+json"}
@@ -268,44 +321,15 @@ def extract_json_ld_contacts(soup):
                 script.string or script.get_text()
             )
 
-            walk(data)
+            walk_jsonld(
+                data,
+                structured_people,
+                emails,
+                phones
+            )
 
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-    return emails, phones
-
-
-def extract_page_data(url: str):
-
-    html, final_url, status, content_type = fetch_public_page(url)
-
-    if html is None:
-
-        return {
-            "url": final_url,
-            "status": status,
-            "title": "",
-            "description": f"Skipped non-HTML content: {content_type}",
-            "text": "",
-            "emails": set(),
-            "phones": set(),
-            "links": [],
-        }
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Extract structured data before removing scripts.
-    jsonld_emails, jsonld_phones = extract_json_ld_contacts(soup)
-
-    for tag in soup([
-        "script",
-        "style",
-        "noscript",
-        "svg",
-        "iframe"
-    ]):
-        tag.decompose()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
 
     title = (
         soup.title.get_text(" ", strip=True)
@@ -322,13 +346,24 @@ def extract_page_data(url: str):
         if description_tag else ""
     )
 
+    # Remove unnecessary HTML
+    for tag in soup([
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "iframe"
+    ]):
+        tag.decompose()
+
     text = re.sub(
         r"\s+",
         " ",
         soup.get_text(" ", strip=True)
     ).strip()
 
-    emails = set(
+    # Emails in visible text
+    emails.update(
         re.findall(
             r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
             text,
@@ -336,22 +371,20 @@ def extract_page_data(url: str):
         )
     )
 
-    phones = set()
-
-    # Mailto links
+    # Mailto
     for anchor in soup.select('a[href^="mailto:"]'):
 
         email = (
             anchor.get("href", "")
             .replace("mailto:", "")
-            .split("?")[0]
+            .split("?", 1)[0]
             .strip()
         )
 
         if email:
             emails.add(email)
 
-    # Telephone links
+    # Tel links
     for anchor in soup.select('a[href^="tel:"]'):
 
         phone = (
@@ -369,20 +402,15 @@ def extract_page_data(url: str):
         text
     ):
 
-        normalized = re.sub(r"\s+", " ", phone).strip()
-
-        digits = re.sub(r"\D", "", normalized)
+        digits = re.sub(r"\D", "", phone)
 
         if 8 <= len(digits) <= 16:
-            phones.add(normalized)
+            phones.add(re.sub(r"\s+", " ", phone).strip())
 
-    emails.update(jsonld_emails)
-    phones.update(jsonld_phones)
+    # Find internal pages
+    same_domain = urlsplit(final_url).netloc.lower()
 
-    # Find internal company pages.
-    current_domain = urlsplit(final_url).netloc.lower()
-
-    relevant_words = (
+    target_words = (
         "about",
         "contact",
         "team",
@@ -393,6 +421,10 @@ def extract_page_data(url: str):
         "company",
         "imprint",
         "who-we-are",
+        "our-story",
+        "meet-the-team",
+        "our-team",
+        "owners",
     )
 
     links = []
@@ -404,21 +436,21 @@ def extract_page_data(url: str):
             anchor["href"].strip()
         ).split("#", 1)[0]
 
-        parsed_link = urlsplit(href)
+        parsed_href = urlsplit(href)
 
         label = anchor.get_text(
             " ",
             strip=True
         ).lower()
 
-        path = parsed_link.path.lower()
+        path = parsed_href.path.lower()
 
         if (
-            parsed_link.scheme in {"http", "https"}
-            and parsed_link.netloc.lower() == current_domain
+            parsed_href.scheme in {"http", "https"}
+            and parsed_href.netloc.lower() == same_domain
             and any(
                 word in (label + " " + path)
-                for word in relevant_words
+                for word in target_words
             )
         ):
 
@@ -433,35 +465,41 @@ def extract_page_data(url: str):
         "emails": emails,
         "phones": phones,
         "links": list(dict.fromkeys(links)),
+        "structured_people": structured_people,
     }
 
 
-def scrape_website(start_url: str, max_pages: int = 6):
+# ============================================================
+# WEBSITE CRAWLER
+# ============================================================
+
+def scrape_website(start_url, max_pages=6):
 
     visited = set()
     queue = [start_url]
     pages = []
 
-    start_domain = urlsplit(start_url).netloc.lower()
+    start_host = urlsplit(start_url).netloc.lower()
 
     while queue and len(pages) < max_pages:
 
-        current_url = queue.pop(0)
+        current = queue.pop(0)
 
-        if current_url in visited:
+        if current in visited:
             continue
 
-        visited.add(current_url)
+        visited.add(current)
 
         try:
 
-            page_data = extract_page_data(current_url)
-            pages.append(page_data)
+            page = extract_page(current)
 
-            for link in page_data.get("links", []):
+            pages.append(page)
+
+            for link in page.get("links", []):
 
                 if (
-                    urlsplit(link).netloc.lower() == start_domain
+                    urlsplit(link).netloc.lower() == start_host
                     and link not in visited
                 ):
                     queue.append(link)
@@ -469,7 +507,8 @@ def scrape_website(start_url: str, max_pages: int = 6):
         except Exception as exc:
 
             pages.append({
-                "url": current_url,
+
+                "url": current,
                 "status": "Error",
                 "title": "",
                 "description": str(exc),
@@ -477,125 +516,493 @@ def scrape_website(start_url: str, max_pages: int = 6):
                 "emails": set(),
                 "phones": set(),
                 "links": [],
+                "structured_people": [],
+
             })
 
-        time.sleep(0.6)
+        time.sleep(0.35)
 
     return pages
 
 
-# =========================================================
-# WEB SEARCH
-# =========================================================
+# ============================================================
+# STRUCTURED PEOPLE FALLBACK
+# ============================================================
 
-def search_web(
-    query: str,
-    max_results: int = 5,
-    backend: str = "auto"
-):
+def structured_people_fallback(company_packets):
 
-    results = []
+    rows = []
+    seen = set()
+
+    for packet in company_packets:
+
+        for person in packet.get("structured_people", []):
+
+            name = str(
+                person.get("Full Name", "")
+            ).strip()
+
+            title = str(
+                person.get("Job Title", "")
+            ).strip()
+
+            if not name or not title:
+                continue
+
+            key = (
+                packet["website"].casefold(),
+                name.casefold(),
+                title.casefold()
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            rows.append({
+
+                "Company": urlsplit(packet["website"]).netloc,
+
+                "Full Name": name,
+
+                "Job Title": title,
+
+                "Source URL": str(
+                    person.get("Source URL", "")
+                ).strip() or packet["website"],
+
+                "Evidence": str(
+                    person.get(
+                        "Evidence",
+                        "Person and job title appear in website structured data."
+                    )
+                ),
+
+                "Confidence": "Structured website data; manually verify",
+
+            })
+
+    return rows
+
+
+# ============================================================
+# GOOGLE / WEB SEARCH
+# ============================================================
+
+def web_search(query, max_results=5, backend="auto"):
 
     try:
 
-        raw_results = DDGS().text(
-            query,
+        results = DDGS(timeout=12).text(
+            query=query,
+            region="us-en",
+            safesearch="moderate",
             max_results=max_results,
-            backend=backend
+            backend=backend,
         )
 
-        for item in raw_results:
+        return [
 
-            results.append({
+            {
                 "title": item.get("title", ""),
                 "url": item.get("href", ""),
                 "snippet": item.get("body", ""),
-            })
+            }
+
+            for item in results
+
+        ]
 
     except Exception as exc:
 
-        results.append({
-            "title": "Search error",
+        return [{
+            "title": "Search unavailable",
             "url": "",
             "snippet": str(exc),
-        })
-
-    return results
+        }]
 
 
-# =========================================================
-# GEMINI API
-# =========================================================
+# ============================================================
+# GEMINI CONFIGURATION
+# ============================================================
 
 def get_gemini_client():
 
     api_key = os.getenv("GEMINI_API_KEY", "")
 
     try:
+
         api_key = api_key or st.secrets.get(
             "GEMINI_API_KEY",
             ""
         )
+
     except Exception:
         pass
 
-    if not api_key:
-        return None
-
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key) if api_key else None
 
 
-def parse_model_json(text: str):
+# ============================================================
+# GEMINI ERROR HANDLING
+# ============================================================
 
-    content = (text or "").strip()
+def show_gemini_error(exc):
 
-    content = re.sub(
+    message = str(exc)
+    lowered = message.lower()
+
+    if (
+        "429" in lowered
+        or "resource_exhausted" in lowered
+        or "quota" in lowered
+    ):
+
+        if any(
+            term in lowered
+            for term in (
+                "quota_exceeded",
+                "current quota",
+                "exceeded your quota",
+                "billing",
+            )
+        ):
+
+            st.error(
+                "Gemini quota/billing limit reached. "
+                "The API key is being read, but Google is not "
+                "allowing another generation request right now."
+            )
+
+            st.warning(
+                "Code cannot remove a Google-side quota limit. "
+                "Check your Google AI Studio project, model limits "
+                "and billing. Website extraction and contact "
+                "details have still been saved."
+            )
+
+        else:
+
+            st.error(
+                "Gemini rate limit reached (429). Wait for the "
+                "limit window to reset, then run the AI step again."
+            )
+
+        st.markdown(
+            "[Check API usage](https://aistudio.google.com/usage) | "
+            "[Check rate limits](https://aistudio.google.com/rate-limit) | "
+            "[Gemini API error guide](https://ai.google.dev/gemini-api/docs/api-errors)"
+        )
+
+    elif "403" in lowered or "permission_denied" in lowered:
+
+        st.error(
+            "Gemini API permission/billing access was denied. "
+            "Check the API key project and Gemini API access."
+        )
+
+    elif "404" in lowered or "not_found" in lowered:
+
+        st.error(
+            "The selected Gemini model was not found or is unavailable. "
+            "Try gemini-3.8-flash or gemini-2.5-flash."
+        )
+
+    else:
+
+        st.error(f"Gemini request failed: {message}")
+
+
+# ============================================================
+# JSON PARSING
+# ============================================================
+
+def parse_json_response(text):
+
+    raw = (text or "").strip()
+
+    raw = re.sub(
         r"^```(?:json)?\s*",
         "",
-        content,
+        raw,
         flags=re.I
     )
 
-    content = re.sub(
-        r"\s*```$",
-        "",
-        content
-    )
+    raw = re.sub(r"\s*```$", "", raw)
 
     try:
-        return json.loads(content)
+        return json.loads(raw)
 
     except json.JSONDecodeError:
         pass
 
-    # Try JSON object
-    start = content.find("{")
-    end = content.rfind("}")
+    for opening, closing in (("{", "}"), ("[", "]")):
 
-    if start >= 0 and end > start:
+        start = raw.find(opening)
+        end = raw.rfind(closing)
 
-        try:
-            return json.loads(
-                content[start:end + 1]
-            )
-        except json.JSONDecodeError:
-            pass
+        if start >= 0 and end > start:
 
-    # Try JSON array
-    start = content.find("[")
-    end = content.rfind("]")
+            try:
+                return json.loads(raw[start:end + 1])
 
-    if start >= 0 and end > start:
-
-        try:
-            return json.loads(
-                content[start:end + 1]
-            )
-        except json.JSONDecodeError:
-            pass
+            except json.JSONDecodeError:
+                continue
 
     return None
 
+
+# ============================================================
+# REMOVE DUPLICATES
+# ============================================================
+
+def dedupe_people(rows):
+
+    clean = []
+    seen = set()
+
+    for row in rows:
+
+        if not isinstance(row, dict):
+            continue
+
+        name = str(
+            row.get("Full Name", "")
+        ).strip()
+
+        title = str(
+            row.get("Job Title", "")
+        ).strip()
+
+        if not name or not title:
+            continue
+
+        key = (
+            name.casefold(),
+            title.casefold(),
+            str(row.get("Company", "")).casefold()
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        clean.append({
+
+            "Company": str(row.get("Company", "")).strip(),
+
+            "Full Name": name,
+
+            "Job Title": title,
+
+            "Source URL": str(
+                row.get("Source URL", "")
+            ).strip(),
+
+            "Evidence": str(
+                row.get("Evidence", row.get("Fit Notes", ""))
+            ).strip(),
+
+            "Confidence": str(
+                row.get("Confidence", "Needs manual verification")
+            ).strip(),
+
+        })
+
+    return clean
+
+
+# ============================================================
+# GEMINI PEOPLE RESEARCH
+# ONE REQUEST FOR ALL WEBSITES
+# ============================================================
+
+def research_people_batch(
+    client,
+    model,
+    company_packets,
+    max_people_per_company=3
+):
+
+    evidence_blocks = []
+
+    for packet in company_packets:
+
+        website = packet["website"]
+
+        page_parts = []
+
+        for page in packet.get("pages", [])[:4]:
+
+            if page.get("text"):
+
+                page_parts.append(
+
+                    "PAGE: " + page.get("title", "") + "\n"
+                    "URL: " + page.get("url", "") + "\n"
+                    "TEXT: " + page.get("text", "")[:1800]
+
+                )
+
+        search_parts = []
+
+        for result in packet.get("search", [])[:5]:
+
+            search_parts.append(
+
+                "TITLE: " + result.get("title", "") + "\n"
+                "URL: " + result.get("url", "") + "\n"
+                "SNIPPET: " + result.get("snippet", "")[:500]
+
+            )
+
+        structured = packet.get("structured_people", [])[:8]
+
+        page_block = "\n\n".join(page_parts)
+        search_block = "\n\n".join(search_parts)
+
+        structured_block = json.dumps(
+            structured,
+            ensure_ascii=False
+        )
+
+        evidence_blocks.append(
+
+            f"\n### COMPANY: {website}\n"
+            f"Website page evidence:\n{page_block}\n"
+            f"Public web search evidence:\n{search_block}\n"
+            f"Structured website people data:\n{structured_block}\n"
+
+        )
+
+    prompt = f"""
+You are a cautious B2B decision-maker researcher.
+Analyze each company separately.
+
+Use ONLY the company page text, structured data and
+public search snippets supplied below.
+
+Do not claim that you performed additional searches.
+Do not invent or infer identities.
+
+FOR EACH COMPANY:
+
+- Identify up to {max_people_per_company} real people.
+- Prefer Owner, Founder, Co-Founder, CEO, President,
+  Managing Director, Partner or General Manager.
+- Use a current job title only when evidence supports it.
+- Do not use an email username to identify a person.
+- Do not confuse similarly named businesses.
+- Only return a person when full name AND job title
+  are supported by the supplied evidence.
+- Return the exact source URL from the supplied evidence.
+- Explain briefly what the source says.
+- If no verified person exists, return no row.
+- Never fabricate names, titles or URLs.
+
+Return JSON only:
+
+{{
+  "people": [
+    {{
+      "Company": "company domain or company name",
+      "Full Name": "publicly supported full name",
+      "Job Title": "publicly supported title",
+      "Source URL": "exact source URL supplied above",
+      "Evidence": "short evidence explanation",
+      "Confidence": "High / Medium"
+    }}
+  ],
+  "notes": "Brief research notes"
+}}
+
+COMPANY EVIDENCE:
+
+{''.join(evidence_blocks)}
+"""
+
+    response = client.models.generate_content(
+
+        model=model,
+
+        contents=prompt,
+
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+
+    )
+
+    parsed = parse_json_response(
+        response.text or ""
+    )
+
+    if isinstance(parsed, list):
+
+        raw_people = parsed
+        notes = ""
+
+    elif isinstance(parsed, dict):
+
+        raw_people = parsed.get("people", [])
+        notes = str(parsed.get("notes", ""))
+
+    else:
+
+        return [], "Gemini returned invalid JSON."
+
+    # Validate source URLs against actual collected sources.
+    allowed_sources = set()
+
+    for packet in company_packets:
+
+        for page in packet.get("pages", []):
+
+            if page.get("url"):
+
+                allowed_sources.add(
+                    str(page["url"]).strip().rstrip("/")
+                )
+
+        for result in packet.get("search", []):
+
+            if result.get("url"):
+
+                allowed_sources.add(
+                    str(result["url"]).strip().rstrip("/")
+                )
+
+        for person in packet.get("structured_people", []):
+
+            if person.get("Source URL"):
+
+                allowed_sources.add(
+                    str(person["Source URL"]).strip().rstrip("/")
+                )
+
+    validated_people = []
+
+    for row in raw_people if isinstance(raw_people, list) else []:
+
+        if not isinstance(row, dict):
+            continue
+
+        source_url = str(
+            row.get("Source URL", "")
+        ).strip().rstrip("/")
+
+        if source_url and source_url in allowed_sources:
+            validated_people.append(row)
+
+    return dedupe_people(validated_people), notes
+
+
+# ============================================================
+# GEMINI GROUNDING SOURCES
+# ============================================================
 
 def extract_grounding_sources(response):
 
@@ -611,12 +1018,9 @@ def extract_grounding_sources(response):
 
         metadata = candidates[0].grounding_metadata
 
-        chunks = (
-            metadata.grounding_chunks
-            if metadata else []
-        )
-
-        for chunk in chunks or []:
+        for chunk in (
+            metadata.grounding_chunks if metadata else []
+        ) or []:
 
             web_source = getattr(
                 chunk,
@@ -654,9 +1058,9 @@ def extract_grounding_sources(response):
     return sources
 
 
-# =========================================================
-# SIDEBAR NAVIGATION
-# =========================================================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 with st.sidebar:
 
@@ -674,25 +1078,24 @@ with st.sidebar:
     st.divider()
 
     st.caption(
-        "Two separate tools. Their inputs and results remain independent."
+        "Two separate tools. Their inputs and results stay separate."
     )
 
     st.caption(
-        "Streamlit • Python • Gemini • Public web search"
+        "Streamlit • Python • Gemini • Web search"
     )
 
 
-# =========================================================
-# TOOL 1: BULK WEBSITE EXTRACTOR
-# =========================================================
+# ============================================================
+# TOOL 1: BULK WEBSITE EXTRACTOR + PERSON FINDER
+# ============================================================
 
 def bulk_extractor_page():
 
     st.markdown(
         '<div class="hero">'
         '<h1>Bulk Website Extractor</h1>'
-        '<p>Extract public website text, available contact details, '
-        'and relevant company pages.</p>'
+        '<p>Extract website content, contacts and publicly supported decision-makers.</p>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -701,86 +1104,92 @@ def bulk_extractor_page():
 
     with left:
 
-        urls_input = st.text_area(
-            "Website URLs (one URL per line)",
-            height=180,
+        urls_text = st.text_area(
+            "Website URLs (one per line)",
+            height=170,
             placeholder=(
                 "https://company1.com\n"
                 "https://company2.com\n"
                 "company3.com"
             ),
-            help="You can paste URLs or upload a TXT/CSV file.",
         )
 
     with right:
 
-        uploaded_file = st.file_uploader(
+        uploaded = st.file_uploader(
             "Upload URL list",
             type=["txt", "csv"],
-            key="bulk_url_upload"
+            key="bulk_urls"
         )
 
         max_pages = st.slider(
             "Maximum pages per website",
             1,
-            15,
+            12,
             6
         )
 
-        do_web_search = st.checkbox(
-            "Also search the web for each company",
+        search_people = st.checkbox(
+            "Search web for company owners / decision-makers",
             value=True
         )
 
-        search_backend_label = st.selectbox(
-            "Search provider",
-            ["Auto", "Google", "Bing"],
-            disabled=not do_web_search,
+        find_people = st.checkbox(
+            "Use Gemini to identify people",
+            value=True
         )
 
-        search_limit = st.slider(
-            "Search results per website",
+        people_per_company = st.slider(
+            "Maximum people per company",
             1,
-            8,
-            4,
-            disabled=not do_web_search
+            5,
+            3,
+            disabled=not find_people
         )
 
-    if uploaded_file:
+        gemini_model = st.text_input(
+            "Gemini model",
+            value=DEFAULT_MODEL,
+            key="bulk_gemini_model"
+        )
 
-        uploaded_text = uploaded_file.getvalue().decode(
+    if uploaded:
+
+        file_text = uploaded.getvalue().decode(
             "utf-8",
             errors="ignore"
         )
 
-        urls_input = (
-            urls_input + "\n" + uploaded_text
+        urls_text = (
+            urls_text + "\n" + file_text
         ).strip()
 
+    st.caption(
+        "Person results require public evidence. "
+        "Unknown names and titles are never guessed."
+    )
+
     if st.button(
-        "🚀 Extract Website Data",
+        "🚀 Extract websites and find people",
         type="primary",
         use_container_width=True
     ):
 
         raw_lines = [
-            line.strip()
-            for line in urls_input.splitlines()
-            if line.strip()
+            x.strip()
+            for x in urls_text.splitlines()
+            if x.strip()
         ]
 
         raw_lines = [
-            line for line in raw_lines
-            if line.lower() not in {
-                "url",
-                "website",
-                "websites",
-                "domain"
+            x for x in raw_lines
+            if x.lower() not in {
+                "url", "website", "websites", "domain"
             }
         ]
 
         urls = []
-        invalid_lines = []
+        invalid = []
 
         for line in raw_lines:
 
@@ -799,176 +1208,443 @@ def bulk_extractor_page():
                     urls.append(normalized)
 
             except ValueError:
-                invalid_lines.append(line)
+                invalid.append(line)
 
         if not urls:
 
+            st.error("Enter at least one valid website URL.")
+            return
+
+        if len(urls) > MAX_WEBSITES:
+
             st.error(
-                "Enter at least one valid website URL."
+                f"Maximum {MAX_WEBSITES} websites per run. "
+                "Split your list into smaller batches."
             )
             return
 
-        if len(urls) > MAX_WEBSITES_PER_RUN:
+        client = None
 
-            st.error(
-                f"Maximum {MAX_WEBSITES_PER_RUN} websites "
-                "are allowed per run. Split your list into batches."
-            )
-            return
+        if find_people:
 
-        search_backend = {
-            "Auto": "auto",
-            "Google": "google",
-            "Bing": "bing",
-        }[search_backend_label]
+            try:
+                client = get_gemini_client()
+
+            except Exception as exc:
+                st.error(f"Gemini initialization failed: {exc}")
 
         all_pages = []
-        all_search_results = []
+        all_search = []
+        packets = []
 
         progress = st.progress(
             0,
-            text="Preparing extraction..."
+            text="Starting website extraction..."
         )
 
-        for index, website_url in enumerate(urls, start=1):
+        status_box = st.empty()
+
+        for index, website in enumerate(urls, start=1):
 
             progress.progress(
                 (index - 1) / len(urls),
-                text=f"Processing {website_url}"
+                text=f"Extracting {website}"
             )
 
-            website_pages = scrape_website(
-                website_url,
+            status_box.write(
+                f"Processing website {index} of {len(urls)}: {website}"
+            )
+
+            pages = scrape_website(
+                website,
                 max_pages=max_pages
             )
 
-            for page_data in website_pages:
+            for page in pages:
 
-                page_data["input_website"] = website_url
+                page["Input Website"] = website
 
-                page_data["emails"] = sorted(
-                    page_data.get("emails", [])
+                page["emails"] = sorted(
+                    page.get("emails", [])
                 )
 
-                page_data["phones"] = sorted(
-                    page_data.get("phones", [])
+                page["phones"] = sorted(
+                    page.get("phones", [])
                 )
 
-                all_pages.append(page_data)
+                all_pages.append(page)
 
-            if do_web_search:
+            search_results = []
 
-                domain = (
-                    urlsplit(website_url)
+            if search_people:
+
+                host = (
+                    urlsplit(website)
                     .netloc.lower()
                     .replace("www.", "")
                 )
 
-                company_guess = (
-                    domain.split(":")[0]
-                    .split(".")[0]
-                    .replace("-", " ")
+                company_guess = next(
+                    (
+                        p.get("title", "")
+                        for p in pages
+                        if p.get("title")
+                    ),
+                    ""
                 )
 
-                web_results = search_web(
-                    f'"{company_guess}" {domain} '
-                    "contact about team leadership",
-                    max_results=search_limit,
-                    backend=search_backend,
+                query = (
+                    f'"{host}" '
+                    '(owner OR founder OR CEO OR president OR '
+                    '"our team" OR leadership)'
                 )
 
-                for result in web_results:
+                if company_guess:
 
-                    result["input_website"] = website_url
+                    query = (
+                        f'"{company_guess}" "{host}" '
+                        '(owner OR founder OR CEO OR president OR team)'
+                    )
 
-                    all_search_results.append(result)
+                search_results = web_search(
+                    query,
+                    max_results=5,
+                    backend="google, bing, brave"
+                )
+
+                for item in search_results:
+
+                    item["Input Website"] = website
+
+                    all_search.append(item)
+
+            structured_people = []
+
+            for page in pages:
+
+                for person in page.get("structured_people", []):
+
+                    person = dict(person)
+
+                    person["Company"] = (
+                        host if search_people
+                        else urlsplit(website).netloc
+                    )
+
+                    structured_people.append(person)
+
+            packets.append({
+
+                "website": website,
+
+                "pages": pages,
+
+                "search": search_results,
+
+                "structured_people": structured_people,
+
+            })
+
+            time.sleep(0.25)
 
         progress.progress(
             1.0,
-            text="Extraction finished."
+            text="Website extraction finished."
         )
+
+        status_box.empty()
+
+        # Save extracted data BEFORE Gemini.
+        # A quota error must not delete website results.
 
         st.session_state["bulk_pages"] = all_pages
 
-        st.session_state["bulk_search_results"] = (
-            all_search_results
+        st.session_state["bulk_search_results"] = all_search
+
+        st.session_state["bulk_invalid"] = invalid
+
+        st.session_state["bulk_packets"] = packets
+
+        st.session_state["bulk_people_per_company"] = int(
+            people_per_company
         )
 
-        st.session_state["bulk_invalid_lines"] = (
-            invalid_lines
+        st.session_state["bulk_find_people_enabled"] = bool(
+            find_people
         )
+
+        st.session_state["bulk_people"] = []
+
+        st.session_state["bulk_people_note"] = ""
+
+        st.session_state["bulk_ai_status"] = "Not requested"
+
+        if find_people:
+
+            if not client:
+
+                st.session_state["bulk_ai_status"] = (
+                    "Gemini key not configured"
+                )
+
+                st.session_state["bulk_people_note"] = (
+                    "Add GEMINI_API_KEY in Streamlit Secrets."
+                )
+
+            else:
+
+                try:
+
+                    with st.spinner(
+                        "Gemini is checking the collected evidence..."
+                    ):
+
+                        # One Gemini request for the entire bulk run.
+                        people, notes = research_people_batch(
+
+                            client,
+
+                            gemini_model.strip() or DEFAULT_MODEL,
+
+                            packets,
+
+                            max_people_per_company=people_per_company,
+
+                        )
+
+                    st.session_state["bulk_people"] = people
+
+                    st.session_state["bulk_people_note"] = notes
+
+                    st.session_state["bulk_ai_status"] = "Completed"
+
+                except Exception as exc:
+
+                    st.session_state["bulk_ai_status"] = (
+                        "Gemini unavailable"
+                    )
+
+                    st.session_state["bulk_people_note"] = str(exc)
+
+                    # Keep any explicitly identified JSON-LD people.
+                    st.session_state["bulk_people"] = (
+                        structured_people_fallback(packets)
+                    )
+
+                    # Website and contact results are preserved.
 
         st.success(
-            f"Completed {len(urls)} website(s), "
-            f"with {len(all_pages)} page result(s)."
+            f"Processed {len(urls)} websites and "
+            f"{len(all_pages)} page results."
         )
 
-    pages = st.session_state.get(
-        "bulk_pages",
-        []
-    )
+        if invalid:
+            st.warning(f"Skipped {len(invalid)} invalid URL lines.")
+
+
+    # --------------------------------------------------------
+    # DISPLAY RESULTS
+    # --------------------------------------------------------
+
+    pages = st.session_state.get("bulk_pages", [])
 
     search_results = st.session_state.get(
         "bulk_search_results",
         []
     )
 
-    invalid_lines = st.session_state.get(
-        "bulk_invalid_lines",
+    people = st.session_state.get(
+        "bulk_people",
         []
     )
 
-    if invalid_lines:
+    ai_status = st.session_state.get(
+        "bulk_ai_status",
+        "Not run"
+    )
 
-        with st.expander("Lines that were skipped"):
-            st.write(invalid_lines)
+    ai_note = st.session_state.get(
+        "bulk_people_note",
+        ""
+    )
 
-    if not pages and not search_results:
+    if not pages:
 
         st.info(
-            "Paste multiple public website URLs above "
-            "and select Extract Website Data."
+            "Paste website URLs above and click the extraction button."
         )
+
         return
 
-    all_emails = sorted({
+    # Retry AI using stored search data.
+    # No need to scrape websites again.
+
+    saved_packets = st.session_state.get(
+        "bulk_packets",
+        []
+    )
+
+    retry_allowed = st.session_state.get(
+        "bulk_find_people_enabled",
+        False
+    )
+
+    if saved_packets and retry_allowed and ai_status != "Completed":
+
+        if st.button(
+            "↻ Retry person identification using saved evidence",
+            use_container_width=True
+        ):
+
+            try:
+
+                retry_client = get_gemini_client()
+
+                if not retry_client:
+
+                    st.error(
+                        "Gemini API key is missing. "
+                        "Add it in Streamlit Secrets."
+                    )
+
+                else:
+
+                    with st.spinner(
+                        "Retrying one Gemini request..."
+                    ):
+
+                        retry_people, retry_notes = research_people_batch(
+
+                            retry_client,
+
+                            st.session_state.get(
+                                "bulk_gemini_model",
+                                DEFAULT_MODEL
+                            ),
+
+                            saved_packets,
+
+                            max_people_per_company=st.session_state.get(
+                                "bulk_people_per_company",
+                                3
+                            ),
+
+                        )
+
+                    st.session_state["bulk_people"] = retry_people
+
+                    st.session_state["bulk_people_note"] = retry_notes
+
+                    st.session_state["bulk_ai_status"] = "Completed"
+
+                    st.rerun()
+
+            except Exception as exc:
+
+                st.session_state["bulk_ai_status"] = "Gemini unavailable"
+
+                st.session_state["bulk_people_note"] = str(exc)
+
+                st.session_state["bulk_people"] = (
+                    structured_people_fallback(saved_packets)
+                )
+
+                st.error(
+                    "Person research could not run. "
+                    "Website and contact extraction are still available."
+                )
+
+                show_gemini_error(exc)
+
+    # Metrics
+
+    email_list = sorted({
         email
         for page in pages
         for email in page.get("emails", [])
     })
 
-    all_phones = sorted({
+    phone_list = sorted({
         phone
         for page in pages
         for phone in page.get("phones", [])
     })
 
-    unique_sites = {
-        page.get("input_website")
+    website_count = len({
+        page.get("Input Website")
         for page in pages
-    }
+    })
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
 
-    metric1.metric(
-        "Pages processed",
-        len(pages)
-    )
+    c1.metric("Websites", website_count)
 
-    metric2.metric(
-        "Websites",
-        len(unique_sites)
-    )
+    c2.metric("Pages processed", len(pages))
 
-    metric3.metric(
-        "Emails found",
-        len(all_emails)
-    )
+    c3.metric("Emails found", len(email_list))
 
-    metric4.metric(
-        "Phone numbers",
-        len(all_phones)
-    )
+    c4.metric("People identified", len(people))
+
+    # People output
+
+    st.subheader("Decision-makers / people found")
+
+    st.caption(f"AI status: {ai_status}")
+
+    if ai_status == "Gemini unavailable":
+
+        show_gemini_error(Exception(ai_note))
+
+    elif ai_status == "Gemini key not configured":
+
+        st.warning(ai_note)
+
+    elif ai_note:
+
+        st.info(ai_note)
+
+    if people:
+
+        people_df = pd.DataFrame(people)
+
+        st.dataframe(
+            people_df[
+                [
+                    "Company",
+                    "Full Name",
+                    "Job Title"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("Person evidence and source URLs"):
+
+            st.dataframe(
+                people_df[
+                    [
+                        "Company",
+                        "Full Name",
+                        "Job Title",
+                        "Source URL",
+                        "Evidence",
+                        "Confidence"
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    else:
+
+        st.info(
+            "No people could be verified from the collected public evidence. "
+            "This does not mean the company has no owner. "
+            "Their names or titles may not be publicly available."
+        )
+
+    # Website results
 
     page_rows = []
 
@@ -976,30 +1652,15 @@ def bulk_extractor_page():
 
         page_rows.append({
 
-            "Input Website": page.get(
-                "input_website",
-                ""
-            ),
+            "Input Website": page.get("Input Website", ""),
 
-            "Page URL": page.get(
-                "url",
-                ""
-            ),
+            "Page URL": page.get("url", ""),
 
-            "Page Title": page.get(
-                "title",
-                ""
-            ),
+            "Page Title": page.get("title", ""),
 
-            "Status": page.get(
-                "status",
-                ""
-            ),
+            "Status": page.get("status", ""),
 
-            "Description": page.get(
-                "description",
-                ""
-            ),
+            "Description": page.get("description", ""),
 
             "Emails": ", ".join(
                 page.get("emails", [])
@@ -1009,33 +1670,31 @@ def bulk_extractor_page():
                 page.get("phones", [])
             ),
 
-            "Extracted Text": page.get(
-                "text",
-                ""
-            ),
+            "Extracted Text": page.get("text", ""),
+
         })
 
     pages_df = pd.DataFrame(page_rows)
 
     st.subheader("Extracted website pages")
 
-    if not pages_df.empty:
+    st.dataframe(
+        pages_df[
+            [
+                "Input Website",
+                "Page URL",
+                "Page Title",
+                "Status",
+                "Description",
+                "Emails",
+                "Phones"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        st.dataframe(
-            pages_df[
-                [
-                    "Input Website",
-                    "Page URL",
-                    "Page Title",
-                    "Status",
-                    "Description",
-                    "Emails",
-                    "Phones",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+    # Contact information
 
     contact_rows = []
 
@@ -1045,10 +1704,7 @@ def bulk_extractor_page():
 
             contact_rows.append({
 
-                "Website": page.get(
-                    "input_website",
-                    ""
-                ),
+                "Website": page.get("Input Website", ""),
 
                 "Email": email,
 
@@ -1056,10 +1712,7 @@ def bulk_extractor_page():
                     page.get("phones", [])
                 ),
 
-                "Source Page": page.get(
-                    "url",
-                    ""
-                ),
+                "Source Page": page.get("url", ""),
 
             })
 
@@ -1075,7 +1728,13 @@ def bulk_extractor_page():
 
     st.subheader("Contact information found")
 
-    if not contacts_df.empty:
+    if contacts_df.empty:
+
+        st.info(
+            "No emails were found in the accessible pages."
+        )
+
+    else:
 
         st.dataframe(
             contacts_df,
@@ -1083,157 +1742,109 @@ def bulk_extractor_page():
             hide_index=True
         )
 
-    else:
-
-        st.info(
-            "No email addresses were found "
-            "on the pages that could be accessed."
-        )
-
     if search_results:
 
-        st.subheader("Public web search results")
+        with st.expander("Public web search evidence"):
 
-        st.dataframe(
-            pd.DataFrame(search_results),
-            use_container_width=True,
-            hide_index=True
-        )
+            st.dataframe(
+                pd.DataFrame(search_results),
+                use_container_width=True,
+                hide_index=True
+            )
 
-    st.subheader("Download extracted data")
+    # Downloads
 
-    download1, download2, download3 = st.columns(3)
+    st.subheader("Download results")
 
-    with download1:
+    d1, d2, d3 = st.columns(3)
+
+    with d1:
 
         st.download_button(
             "Download pages CSV",
             pages_df.to_csv(
                 index=False
             ).encode("utf-8-sig"),
-            file_name="website_pages.csv",
-            mime="text/csv",
+            "website_pages.csv",
+            "text/csv",
             use_container_width=True,
         )
 
-    with download2:
+    with d2:
 
         st.download_button(
             "Download contacts CSV",
             contacts_df.to_csv(
                 index=False
             ).encode("utf-8-sig"),
-            file_name="website_contacts.csv",
-            mime="text/csv",
+            "website_contacts.csv",
+            "text/csv",
             use_container_width=True,
         )
 
-    with download3:
+    with d3:
 
-        excel_buffer = io.BytesIO()
-
-        with pd.ExcelWriter(
-            excel_buffer,
-            engine="openpyxl"
-        ) as writer:
-
-            pages_df.to_excel(
-                writer,
-                index=False,
-                sheet_name="Website Pages"
-            )
-
-            contacts_df.to_excel(
-                writer,
-                index=False,
-                sheet_name="Contacts"
-            )
-
-            pd.DataFrame(
-                search_results
-            ).to_excel(
-                writer,
-                index=False,
-                sheet_name="Web Search"
-            )
+        people_df = pd.DataFrame(
+            people,
+            columns=[
+                "Company",
+                "Full Name",
+                "Job Title",
+                "Source URL",
+                "Evidence",
+                "Confidence"
+            ]
+        )
 
         st.download_button(
-            "Download all as Excel",
-            excel_buffer.getvalue(),
-            file_name="website_research.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
+            "Download people CSV",
+            people_df.to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            "company_people.csv",
+            "text/csv",
             use_container_width=True,
         )
 
-    with st.expander("View full extracted page text"):
+    with st.expander("View full extracted website text"):
 
-        if pages:
+        chosen = st.selectbox(
+            "Select page",
+            range(len(pages)),
+            format_func=lambda i: (
+                f'{pages[i].get("Input Website", "")} | '
+                f'{pages[i].get("title", "") or pages[i].get("url", "")}'
+            ),
+        )
 
-            selected_page_index = st.selectbox(
-                "Choose a page",
-                range(len(pages)),
-                format_func=lambda i: (
-                    f'{pages[i].get("input_website", "")} | '
-                    f'{pages[i].get("title", "") or pages[i].get("url", "")}'
-                ),
-            )
-
-            st.text_area(
-                "Extracted text",
-                value=pages[selected_page_index].get(
-                    "text",
-                    ""
-                ),
-                height=300,
-                disabled=True,
-            )
+        st.text_area(
+            "Page content",
+            pages[chosen].get("text", ""),
+            height=280,
+            disabled=True,
+        )
 
 
-# =========================================================
-# TOOL 2: GEMINI AI COMPANY RESEARCH
-# =========================================================
+# ============================================================
+# TOOL 2: AI COMPANY RESEARCH
+# ============================================================
 
 def ai_research_page():
 
     st.markdown(
         '<div class="hero">'
         '<h1>AI Company Research</h1>'
-        '<p>Use Gemini with Google Search grounding to research '
-        'matching companies and public decision-maker details.</p>'
+        '<p>Research companies and decision-makers using Gemini and Google Search.</p>'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    client = None
-
-    try:
-
-        client = get_gemini_client()
-
-    except Exception as exc:
-
-        st.error(
-            f"Gemini client initialization failed: {exc}"
-        )
-
-    if not client:
-
-        st.warning(
-            "Gemini API key is missing. Add GEMINI_API_KEY "
-            "in Streamlit Cloud Secrets or set it as an "
-            "environment variable. Do not put the key in app.py."
-        )
-
     brief = st.text_area(
         "Client brief / Research instructions",
-        height=190,
+        height=180,
         placeholder=(
-            "Example: Find US-based B2B SaaS companies in "
-            "the healthcare industry, 11–200 employees. "
-            "Identify the relevant sales or marketing decision-makers."
+            "Example: Find US-based B2B SaaS companies in healthcare, "
+            "11–200 employees, and identify relevant decision-makers."
         ),
     )
 
@@ -1241,14 +1852,14 @@ def ai_research_page():
 
     with col1:
 
-        target_region = st.text_input(
+        region = st.text_input(
             "Target country / region",
             placeholder="United States"
         )
 
     with col2:
 
-        target_industry = st.text_input(
+        industry = st.text_input(
             "Industry (optional)",
             placeholder="Healthcare SaaS"
         )
@@ -1263,14 +1874,14 @@ def ai_research_page():
             step=1
         )
 
-    model_name = st.text_input(
+    model = st.text_input(
         "Gemini model",
-        value="gemini-3.8-flash"
+        value=DEFAULT_MODEL,
+        key="research_model"
     )
 
     st.caption(
-        "Final contact list shows Full Name and Job Title. "
-        "Company and source evidence are available separately. "
+        "Final contact list contains Full Name and Job Title. "
         "Email finding is not included."
     )
 
@@ -1282,62 +1893,77 @@ def ai_research_page():
 
         if not brief.strip():
 
-            st.error(
-                "Enter the client brief before starting research."
-            )
+            st.error("Enter the client brief first.")
+            return
+
+        try:
+
+            client = get_gemini_client()
+
+        except Exception as exc:
+
+            st.error(f"Gemini initialization failed: {exc}")
             return
 
         if not client:
 
             st.error(
-                "Gemini API key is not configured."
+                "Gemini API key is missing. "
+                "Add GEMINI_API_KEY in Streamlit Secrets."
             )
+
             return
 
-        if not model_name.strip():
+        # Clear old results
 
-            st.error(
-                "Enter a Gemini model name."
-            )
-            return
+        st.session_state["research_contacts"] = []
+        st.session_state["research_summary"] = ""
+        st.session_state["research_sources"] = []
+        st.session_state["research_raw"] = ""
 
         prompt = f"""
 You are a careful B2B company and decision-maker research assistant.
-Use Google Search grounding to find current, publicly available evidence.
-Do not rely only on your built-in knowledge.
+
+Use Google Search grounding for current public evidence.
+Never invent facts.
 
 CLIENT BRIEF:
 {brief}
 
-TARGET COUNTRY / REGION: {target_region or "Use the client brief"}
-TARGET INDUSTRY: {target_industry or "Use the client brief"}
-MAXIMUM CONTACTS: {int(max_contacts)}
+TARGET COUNTRY / REGION:
+{region or 'Use the brief'}
 
-RESEARCH RULES:
-1. Interpret the ICP carefully and identify companies that genuinely match it.
-2. Find real people at those companies only when their full name and current public job title
-   are supported by a public web source.
-3. Do not guess names, titles, employers, current employment, company size, or facts.
-4. Do not generate, infer, or search for email addresses or phone numbers.
-5. Return no more than {int(max_contacts)} distinct contacts.
-6. Avoid duplicate people and exclude anyone whose name or current title is not supported.
-7. Include the actual public source URL for every contact whenever available.
-8. Choose job functions relevant to the client brief. If unclear, select appropriate decision-makers
-   and briefly explain why.
-9. If reliable matches are fewer than requested, return fewer. Never fill the list with guesses.
-10. Output valid JSON only. Do not wrap it in Markdown code fences.
+TARGET INDUSTRY:
+{industry or 'Use the brief'}
 
-Return this JSON structure:
+MAXIMUM CONTACTS:
+{int(max_contacts)}
+
+RULES:
+
+- Identify companies matching the brief.
+- Include real people only when their full name, current job title
+  and company connection are publicly supported.
+- Prioritize relevant founders, owners, CEOs, presidents,
+  managing directors and requested job functions.
+- Do not guess identities or titles.
+- Do not generate or find email addresses.
+- Return fewer contacts rather than inventing records.
+- Avoid duplicates.
+- Include a source URL for every person.
+
+Return JSON only:
+
 {{
-  "summary": "Short explanation of the interpreted ICP and research approach",
+  "summary": "Short interpretation of the ICP and research approach",
   "contacts": [
     {{
       "Full Name": "Person's full name",
       "Job Title": "Current public job title",
       "Company": "Company name",
       "Company Website": "https://company.example",
-      "Source URL": "https://public-source.example/profile-or-team-page",
-      "Fit Notes": "Short evidence-based reason this person/company matches"
+      "Source URL": "https://public-source.example/profile",
+      "Fit Notes": "Brief evidence-based match explanation"
     }}
   ]
 }}
@@ -1346,12 +1972,12 @@ Return this JSON structure:
         try:
 
             with st.spinner(
-                "Gemini is searching public web sources and checking the brief..."
+                "Gemini is researching public web sources..."
             ):
 
                 response = client.models.generate_content(
 
-                    model=model_name.strip(),
+                    model=model.strip() or DEFAULT_MODEL,
 
                     contents=prompt,
 
@@ -1364,12 +1990,14 @@ Return this JSON structure:
                         ],
 
                         temperature=0.2,
+
                     ),
+
                 )
 
-            raw_response = response.text or ""
-
-            parsed = parse_model_json(raw_response)
+            parsed = parse_json_response(
+                response.text or ""
+            )
 
             if isinstance(parsed, list):
 
@@ -1380,115 +2008,89 @@ Return this JSON structure:
 
             if not isinstance(parsed, dict):
 
-                st.error(
-                    "Gemini returned an answer that could not be read as JSON. "
-                    "See the raw response below."
+                raise ValueError(
+                    "Gemini returned invalid JSON. Please run again."
                 )
 
-                st.session_state["research_contacts"] = []
-                st.session_state["research_summary"] = ""
-                st.session_state["research_raw"] = raw_response
+            contacts = []
+            seen = set()
 
-                st.session_state["research_sources"] = (
-                    extract_grounding_sources(response)
+            for row in parsed.get("contacts", []):
+
+                if not isinstance(row, dict):
+                    continue
+
+                name = str(
+                    row.get("Full Name", "")
+                ).strip()
+
+                title = str(
+                    row.get("Job Title", "")
+                ).strip()
+
+                if not name or not title:
+                    continue
+
+                key = (
+                    name.casefold(),
+                    title.casefold()
                 )
 
-            else:
+                if key in seen:
+                    continue
 
-                raw_contacts = parsed.get(
-                    "contacts",
-                    []
-                )
+                seen.add(key)
 
-                cleaned_contacts = []
-                seen_people = set()
+                contacts.append({
 
-                if isinstance(raw_contacts, list):
+                    "Full Name": name,
 
-                    for item in raw_contacts:
+                    "Job Title": title,
 
-                        if not isinstance(item, dict):
-                            continue
+                    "Company": str(
+                        row.get("Company", "")
+                    ).strip(),
 
-                        full_name = str(
-                            item.get("Full Name", "")
-                        ).strip()
+                    "Company Website": str(
+                        row.get("Company Website", "")
+                    ).strip(),
 
-                        job_title = str(
-                            item.get("Job Title", "")
-                        ).strip()
+                    "Source URL": str(
+                        row.get("Source URL", "")
+                    ).strip(),
 
-                        if not full_name or not job_title:
-                            continue
+                    "Fit Notes": str(
+                        row.get("Fit Notes", "")
+                    ).strip(),
 
-                        duplicate_key = (
-                            full_name.casefold(),
-                            job_title.casefold()
-                        )
+                })
 
-                        if duplicate_key in seen_people:
-                            continue
+                if len(contacts) >= int(max_contacts):
+                    break
 
-                        seen_people.add(duplicate_key)
+            st.session_state["research_contacts"] = contacts
 
-                        cleaned_contacts.append({
+            st.session_state["research_summary"] = str(
+                parsed.get("summary", "")
+            )
 
-                            "Full Name": full_name,
+            st.session_state["research_sources"] = (
+                extract_grounding_sources(response)
+            )
 
-                            "Job Title": job_title,
-
-                            "Company": str(
-                                item.get("Company", "")
-                            ).strip(),
-
-                            "Company Website": str(
-                                item.get("Company Website", "")
-                            ).strip(),
-
-                            "Source URL": str(
-                                item.get("Source URL", "")
-                            ).strip(),
-
-                            "Fit Notes": str(
-                                item.get("Fit Notes", "")
-                            ).strip(),
-
-                        })
-
-                        if len(cleaned_contacts) >= int(max_contacts):
-                            break
-
-                st.session_state["research_contacts"] = (
-                    cleaned_contacts
-                )
-
-                st.session_state["research_summary"] = str(
-                    parsed.get("summary", "")
-                )
-
-                st.session_state["research_raw"] = (
-                    raw_response
-                )
-
-                st.session_state["research_sources"] = (
-                    extract_grounding_sources(response)
-                )
+            st.session_state["research_raw"] = (
+                response.text or ""
+            )
 
             st.success(
-                "Research request completed."
+                f"Research completed: {len(contacts)} contact(s)."
             )
 
         except Exception as exc:
 
-            st.error(
-                f"Gemini research failed: {exc}"
-            )
+            show_gemini_error(exc)
 
-            st.info(
-                "Check the API key, model availability, Gemini API quota, "
-                "and whether Google Search grounding is enabled "
-                "for your Gemini API project."
-            )
+    # Display research
 
     contacts = st.session_state.get(
         "research_contacts",
@@ -1505,44 +2107,34 @@ Return this JSON structure:
         []
     )
 
-    raw_response = st.session_state.get(
+    raw = st.session_state.get(
         "research_raw",
         ""
     )
 
     if summary:
 
-        st.subheader(
-            "Research interpretation"
-        )
+        st.subheader("Research interpretation")
 
         st.write(summary)
 
     if contacts:
 
-        contacts_df = pd.DataFrame(contacts)
+        df = pd.DataFrame(contacts)
 
-        metric_a, metric_b = st.columns(2)
+        m1, m2 = st.columns(2)
 
-        metric_a.metric(
-            "Contacts returned",
-            len(contacts_df)
-        )
+        m1.metric("Contacts found", len(df))
 
-        metric_b.metric(
+        m2.metric(
             "Companies represented",
-            contacts_df["Company"].replace(
-                "",
-                pd.NA
-            ).nunique()
+            df["Company"].replace("", pd.NA).nunique()
         )
 
-        st.subheader(
-            "Contact results"
-        )
+        st.subheader("Contact results")
 
         st.dataframe(
-            contacts_df[
+            df[
                 [
                     "Full Name",
                     "Job Title"
@@ -1552,12 +2144,10 @@ Return this JSON structure:
             hide_index=True,
         )
 
-        with st.expander(
-            "Company research and individual source URLs"
-        ):
+        with st.expander("Company evidence and source URLs"):
 
             st.dataframe(
-                contacts_df[
+                df[
                     [
                         "Company",
                         "Company Website",
@@ -1571,8 +2161,7 @@ Return this JSON structure:
 
         st.download_button(
             "Download contact list CSV",
-
-            contacts_df[
+            df[
                 [
                     "Full Name",
                     "Job Title"
@@ -1580,52 +2169,41 @@ Return this JSON structure:
             ].to_csv(
                 index=False
             ).encode("utf-8-sig"),
-
-            file_name="researched_contacts.csv",
-
-            mime="text/csv",
-
+            "researched_contacts.csv",
+            "text/csv",
             use_container_width=True,
         )
 
         st.download_button(
             "Download full research CSV",
-
-            contacts_df.to_csv(
+            df.to_csv(
                 index=False
             ).encode("utf-8-sig"),
-
-            file_name="full_company_research.csv",
-
-            mime="text/csv",
-
+            "full_company_research.csv",
+            "text/csv",
             use_container_width=True,
         )
 
     if sources:
 
-        with st.expander(
-            "Google Search grounding sources"
-        ):
+        with st.expander("Google Search grounding sources"):
 
             st.dataframe(
                 pd.DataFrame(sources),
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
             )
 
-    if raw_response and not contacts:
+    if raw and not contacts:
 
-        with st.expander(
-            "View Gemini raw response"
-        ):
+        with st.expander("Last Gemini response"):
 
-            st.text(raw_response)
+            st.text(raw)
 
 
-# =========================================================
-# MAIN APP ROUTER
-# =========================================================
+# ============================================================
+# APP ROUTER
+# ============================================================
 
 if selected_tool == "Bulk Website Extractor":
 
@@ -1639,9 +2217,8 @@ else:
 st.divider()
 
 st.caption(
-    "Responsible-use note: extract only public pages you are permitted to access. "
-    "Respect each website's terms, robots.txt, request limits, and applicable laws. "
-    "This app does not log in, bypass CAPTCHAs, or access paywalled/private content. "
-    "Extracted and AI-generated information must be checked against the original "
-    "source before client delivery."
+    "Use only public pages you are permitted to access. "
+    "Respect website terms, robots policies and request limits. "
+    "This app does not log in, bypass CAPTCHAs or access private/paywalled content. "
+    "Verify people and job titles against original sources before delivery."
 )
