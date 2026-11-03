@@ -36,6 +36,7 @@ st.caption("Built by Faiz Khan")
 
 WORKERS = 24
 HARD_CAP = 3000
+ENRICH_CAP = 150
 SEARCH_LOCK = threading.Lock()
 OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
             "https://overpass.private.coffee/api/interpreter"]
@@ -190,8 +191,10 @@ GENERIC_WORDS = {"company", "companies", "services", "service", "near", "best", 
 
 UNIT = r"(?:billion|million|thousand|bn|mm|b|m|k)"
 MONEY_RE = re.compile(r"\$\s?(\d[\d,]*\.?\d*)\s*(billion|million|thousand|bn|mm|b|m|k)?\b", re.I)
+MONEY_UNIT_RE = re.compile(r"\$?\s?(\d[\d,]*\.?\d*)\s*(billion|million|thousand|bn|mm|k|m|b)\b", re.I)
 EMP_RANGE_RE = re.compile(r"(\d[\d,]*)\s*(?:-|–|to)\s*(\d[\d,]*)\+?\s*(?:employees|staff|team members)", re.I)
 EMP_ONE_RE = re.compile(r"(\d[\d,]*)\+?\s*(?:employees|staff)", re.I)
+REV_WORD_RE = r"rev[ei]n[ue]+\b|sales|turnover"
 
 
 # ---------- basic helpers ----------
@@ -541,15 +544,22 @@ def fmt_emp(emp):
 
 
 def parse_revenue(text):
-    for m in re.finditer(r"revenue|sales", text, re.I):
+    for m in re.finditer(REV_WORD_RE, text, re.I):
         window = text[max(0, m.start() - 60): m.end() + 140]
         found = []
+        for mm in MONEY_UNIT_RE.finditer(window):
+            val = to_usd_m(mm.group(1), mm.group(2))
+            if val is not None:
+                found.append((val, mm.start(), mm.end()))
         for mm in MONEY_RE.finditer(window):
+            if any(f[1] <= mm.start() < f[2] for f in found):
+                continue
             val = to_usd_m(mm.group(1), mm.group(2))
             if val is not None:
                 found.append((val, mm.start(), mm.end()))
         if not found:
             continue
+        found.sort(key=lambda x: x[1])
         lo = hi = found[0][0]
         if len(found) > 1:
             gap = window[found[0][2]: found[1][1]]
@@ -630,11 +640,20 @@ def passes(info, emp_min, emp_max, rev_min, rev_max):
     return True
 
 
+def out_of_range(info, emp_min, emp_max, rev_min, rev_max):
+    emp, rev = info["emp"], info["rev"]
+    if (emp_min or emp_max) and emp and not overlaps(emp[0], emp[1], emp_min, emp_max):
+        return True
+    if (rev_min or rev_max) and rev and not overlaps(rev[0], rev[1], rev_min, rev_max):
+        return True
+    return False
+
+
 # ---------- description understanding ----------
 def clean_description(desc):
     q = EMP_RANGE_RE.sub(" ", desc)
     q = EMP_ONE_RE.sub(" ", q)
-    q = re.sub(r"(revenue|sales)[^,.;\n]*", " ", q, flags=re.I)
+    q = re.sub(r"(rev[ei]n[ue]+|sales)[^,.;\n]*", " ", q, flags=re.I)
     money = r"\$\s?\d[\d,.]*\s*" + UNIT + r"?(?:\s*(?:-|–|to)\s*\$?\s*\d[\d,.]*\s*" + UNIT + r"?)?"
     q = re.sub(money, " ", q, flags=re.I)
     return " ".join(q.replace(",", " ").split())
@@ -655,7 +674,7 @@ def detect_filters(desc):
 def detect_wants(desc):
     low = desc.lower()
     return {
-        "revenue": bool(re.search(r"\brevenue|\bsales\b|turnover", low)),
+        "revenue": bool(re.search(REV_WORD_RE, low)),
         "employees": bool(re.search(r"employee|staff size|company size|team size|headcount", low)),
         "email": bool(re.search(r"\be-?mails?\b", low)),
         "phone": bool(re.search(r"\bphones?\b|contact numbers?|mobile", low)),
@@ -708,8 +727,15 @@ def get_secret(name, default=""):
         return default
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
 def ai_parse(desc, api_key, models):
+    cache = st.session_state.setdefault("ai_cache", {})
+    ck = desc.strip()
+    if ck in cache:
+        return cache[ck], ""
+    fail = st.session_state.get("ai_fail")
+    if fail and time.time() - fail[0] < 60:
+        return None, fail[1] + " (60 second baad dobara koshish hogi)"
+
     prompt = (
         "Read this client's lead-generation request and reply with ONLY JSON in this shape: "
         '{"niches": ["up to 6 short business-type phrases, e.g. real estate agency, dental clinic"], '
@@ -724,27 +750,37 @@ def ai_parse(desc, api_key, models):
         "Never invent employee or revenue numbers: use 0 unless the client explicitly states them. "
         "Revenue is in millions of USD.\n\nRequest: " + desc
     )
-    last = "koi model try nahi hua"
+    errors = []
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        try:
-            r = requests.post(
-                url,
-                headers={"x-goog-api-key": api_key},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json"},
-                },
-                timeout=30,
-            )
-            if r.status_code != 200:
-                last = f"{model}: HTTP {r.status_code} {r.text[:160]}"
-                continue
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text), ""
-        except Exception as e:
-            last = f"{model}: {e}"
-    return None, last
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    url,
+                    headers={"x-goog-api-key": api_key},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"responseMimeType": "application/json"},
+                    },
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    data = json.loads(text)
+                    cache[ck] = data
+                    st.session_state.pop("ai_fail", None)
+                    return data, ""
+                errors.append(f"{model}: HTTP {r.status_code}")
+                if r.status_code in (429, 500, 503) and attempt == 0:
+                    time.sleep(2)
+                    continue
+                break
+            except Exception as e:
+                errors.append(f"{model}: {str(e)[:80]}")
+                break
+    msg = " | ".join(errors[-4:])
+    st.session_state["ai_fail"] = (time.time(), msg)
+    return None, msg
 
 
 # ---------- geography ----------
@@ -1292,7 +1328,7 @@ def run_batch(recs, deep, emails_on, people_on, use_search, status):
         if r["key"] not in seen:
             seen.add(r["key"])
             unique.append(r)
-    res = {"rows": [], "people": [], "failed": []}
+    res = {"rows": [], "people": [], "failed": [], "unknown": []}
     if not unique:
         return res
     bar = st.progress(0.0)
@@ -1322,6 +1358,18 @@ def apply_info(row, info):
     row["Confidence"] = info["confidence"]
 
 
+def trim_rows(rows, per_group):
+    if not per_group:
+        return rows
+    out, cnt = [], {}
+    for r in rows:
+        k = r.get("Niche", "")
+        if cnt.get(k, 0) < per_group:
+            out.append(r)
+            cnt[k] = cnt.get(k, 0) + 1
+    return out
+
+
 # ---------- results ----------
 def cols_for(wants, d_filters):
     cols = ["Website", "Company", "Niche", "Street", "City", "State", "ZIP", "Country"] + SOCIAL_COLS + ["Phone"]
@@ -1342,31 +1390,44 @@ ALL_COLS = ["Website", "Company", "Niche", "Street", "City", "State", "ZIP", "Co
     "Phone", "Emails", "People (name - title)", "Category", "Source"]
 
 
+def rows_to_df(rows, cols):
+    df = pd.DataFrame(rows)
+    if "_score" in df.columns:
+        df = df.sort_values("_score", ascending=False).drop(columns=["_score"])
+    df["_k"] = df["Website"].where(df["Website"] != "", df["Company"] + "|" + df["Street"])
+    df = df.drop_duplicates(subset=["_k"]).drop(columns=["_k"])
+    return df[[c for c in cols if c in df.columns]]
+
+
 def show_results():
     res = st.session_state.get("res")
     if not res:
         return
+    cols = res.get("cols", ALL_COLS)
     if res.get("stats"):
         st.success(res["stats"])
     for n in res.get("notes", []):
         st.caption("Note: " + n)
     rows = res["rows"]
+    unknown = res.get("unknown") or []
     if rows:
-        df = pd.DataFrame(rows)
-        if "_score" in df.columns:
-            df = df.sort_values("_score", ascending=False).drop(columns=["_score"])
-        df["_k"] = df["Website"].where(df["Website"] != "", df["Company"] + "|" + df["Street"])
-        df = df.drop_duplicates(subset=["_k"]).drop(columns=["_k"])
-        want_cols = [c for c in res.get("cols", ALL_COLS) if c in df.columns]
-        df = df[want_cols]
+        df = rows_to_df(rows, cols)
         st.dataframe(df, use_container_width=True)
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8-sig"), "leads.csv", key="dl_master")
         if res["people"]:
             pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
             st.download_button("Download People CSV (har banda ek row)",
                                pdf.to_csv(index=False).encode("utf-8-sig"), "people.csv", key="dl_people")
+    elif unknown:
+        st.info("Aap ki range mein data-wali koi company match nahi hui. Neeche wo companies hain jin ka size/revenue data nahi mila.")
     else:
         st.warning("Koi data nahi nikla.")
+    if unknown:
+        st.subheader(f"Size/revenue ka data nahi mila ({len(unknown)} companies, aap khud check kar lo)")
+        udf = rows_to_df(unknown, cols)
+        st.dataframe(udf, use_container_width=True)
+        st.download_button("Download CSV (data nahi mila wali)", udf.to_csv(index=False).encode("utf-8-sig"),
+                           "leads_unknown.csv", key="dl_unknown")
     if res["failed"]:
         with st.expander(f"{len(res['failed'])} skip hui (website khuli nahi, niche ya location se match nahi)"):
             st.write(", ".join(res["failed"]))
@@ -1414,10 +1475,12 @@ with tab_search:
         groups = groups_from_text(desc)
 
         locations = [n for n, _ in STATE_LIST if re.search(r"\b" + re.escape(n) + r"\b", desc, re.I)]
-        for m in re.finditer(r"\b([A-Z]{2})\b", desc):
+        for m in re.finditer(r"\b([A-Za-z]{2})\b", desc):
             c = m.group(1)
-            if c in CODE2NAME and c not in AMBIGUOUS_CODES and CODE2NAME[c] not in locations:
-                locations.append(CODE2NAME[c])
+            if c.isupper() or c.istitle():
+                c = c.upper()
+                if c in CODE2NAME and c not in AMBIGUOUS_CODES and CODE2NAME[c] not in locations:
+                    locations.append(CODE2NAME[c])
         if re.search(r"\bnyc\b|new york city", desc, re.I):
             locations = [l for l in locations if l != "New York"] + ["New York City"]
         if re.search(r"\b(usa|u\.s\.a?\.?|united states|america)\b", desc, re.I):
@@ -1567,9 +1630,9 @@ with tab_search:
         recs = list(all_found.values())[:HARD_CAP]
 
         infos = {}
+        unknown_keys = set()
         if filters_on:
-            status.write("Step 1c: size/revenue filter ke liye check ho raha hai (slow)...")
-            cand = recs[:300]
+            cand = recs[:ENRICH_CAP]
             need = [r for r in cand if not r["name"]]
             with ThreadPoolExecutor(max_workers=8) as ex:
                 futs = {ex.submit(name_for_domain, r["domain"]): r for r in need if r["domain"]}
@@ -1579,45 +1642,51 @@ with tab_search:
             bar2 = st.progress(0.0)
             cand = [r for r in cand if r["name"]]
             for n, r in enumerate(cand):
-                status.write(f"Step 1c: size/revenue {n + 1}/{len(cand)}: {r['name']}")
+                status.write(f"Step 1c: size/revenue check {n + 1}/{len(cand)}: {r['name']}")
                 bar2.progress((n + 1) / max(len(cand), 1))
                 info = enrich(r["name"])
-                if passes(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max):
-                    kept.append(r)
-                    infos[r["key"]] = info
+                infos[r["key"]] = info
+                if out_of_range(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max):
+                    continue
+                kept.append(r)
+                if not passes(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max):
+                    unknown_keys.add(r["key"])
             recs = kept
 
         if not recs:
             st.session_state["res"] = None
-            st.warning("Aap ki size/revenue range mein kisi ka data nahi mila. Range wider karo ya filter hata do.")
+            st.warning("Jin companies ka data mila wo sab aap ki range se bahar thin. Range wider karo.")
         else:
             res = run_batch(recs, deep, emails_on, people_on, people_on and len(recs) <= 25, status)
+            res["unknown"] = [r for r in res["rows"] if r["_key"] in unknown_keys]
+            res["rows"] = [r for r in res["rows"] if r["_key"] not in unknown_keys]
             res["rows"].sort(key=lambda r: r["_score"], reverse=True)
-            if per_group:
-                kept_rows, cnt = [], {}
-                for r in res["rows"]:
-                    k = r.get("Niche", "")
-                    if cnt.get(k, 0) < per_group:
-                        kept_rows.append(r)
-                        cnt[k] = cnt.get(k, 0) + 1
-                res["rows"] = kept_rows
+            res["unknown"].sort(key=lambda r: r["_score"], reverse=True)
+            res["rows"] = trim_rows(res["rows"], per_group)
+            res["unknown"] = trim_rows(res["unknown"], per_group)
+
+            for row in res["rows"] + res["unknown"]:
+                info = infos.get(row["_key"])
+                if info is not None:
+                    apply_info(row, info)
 
             if wants["revenue"] or wants["employees"]:
-                todo = res["rows"][:200]
+                todo = [r for r in res["rows"] if r["_key"] not in infos][:200]
                 for n, row in enumerate(todo):
-                    info = infos.get(row["_key"])
-                    if info is None:
-                        status.write(f"Step 3: size/revenue andaza {n + 1}/{len(todo)}: {row['Company']}")
-                        info = enrich(row["Company"])
-                    apply_info(row, info)
+                    status.write(f"Step 3: size/revenue andaza {n + 1}/{len(todo)}: {row['Company']}")
+                    apply_info(row, enrich(row["Company"]))
 
             res["notes"] = notes
             res["cols"] = cols_for(wants, (d_emp_min, d_emp_max, d_rev_min, d_rev_max))
             final_counts = {}
             for r in res["rows"]:
                 final_counts[r.get("Niche", "")] = final_counts.get(r.get("Niche", ""), 0) + 1
-            res["stats"] = ("Search: " + " | ".join(stat_lines) + " || Final CSV: "
-                            + ", ".join(f"{k or 'sab'}: {v}" for k, v in final_counts.items()))
+            stats = "Search: " + " | ".join(stat_lines) + " || Final CSV: " + (
+                ", ".join(f"{k or 'sab'}: {v}" for k, v in final_counts.items()) or "0")
+            if filters_on:
+                stats += (f" || Range match: {len(res['rows'])} | Data nahi mila (alag list): {len(res['unknown'])}"
+                          f" | jaanch hui: {min(len(all_found), ENRICH_CAP)} companies")
+            res["stats"] = stats
             st.session_state["res"] = res
             status.write("Mukammal!")
 
