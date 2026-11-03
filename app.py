@@ -34,9 +34,11 @@ st.set_page_config(page_title="Decision-Maker Finder", layout="wide")
 st.title("Decision-Maker & Contact Finder")
 st.caption("Built by Faiz Khan")
 
-WORKERS = 24
+WORKERS = 16
 HARD_CAP = 3000
-ENRICH_CAP = 150
+DEFAULT_CAP = 300
+ENRICH_CAP = 80
+ENRICH_SECONDS = 240
 SEARCH_LOCK = threading.Lock()
 OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
             "https://overpass.private.coffee/api/interpreter"]
@@ -581,38 +583,35 @@ def parse_employees(text):
     return None
 
 
-def enrich(company):
-    empty = {"emp": None, "rev": None, "emp_src": "", "rev_src": "", "link": "", "confidence": ""}
+def empty_info():
+    return {"emp": None, "rev": None, "emp_src": "", "rev_src": "", "link": "", "confidence": ""}
+
+
+def enrich(company, city="", state=""):
+    info = empty_info()
     if DDGS is None or not company:
-        return empty
+        return info
     words = [w for w in company.lower().split() if w not in ("the", "a", "and")]
     token = words[0] if words else company.lower()
     emps, revs = [], []
-    queries = [f'"{company}" revenue employees', f'"{company}" company size employees']
-    with SEARCH_LOCK:
-        for q in queries:
-            try:
-                results = DDGS().text(q, max_results=10)
-            except Exception:
-                results = []
-            for r in results or []:
-                href = r.get("href", "")
-                site = next((s for s in INFO_SITES if s in href), None)
-                if not site:
-                    continue
-                blob = r.get("title", "") + " . " + r.get("body", "")
-                if token not in blob.lower():
-                    continue
-                rv, em = parse_revenue(blob), parse_employees(blob)
-                if rv:
-                    revs.append((rv, site, href))
-                if em:
-                    emps.append((em, site, href))
-            time.sleep(1)
-            if emps and revs:
-                break
-
-    info = dict(empty)
+    q = " ".join(x for x in [company, city, state, "revenue employees"] if x)
+    try:
+        results = DDGS().text(q, region="us-en", max_results=10)
+    except Exception:
+        results = []
+    for r in results or []:
+        href = r.get("href", "")
+        site = next((s for s in INFO_SITES if s in href), None)
+        if not site:
+            continue
+        blob = r.get("title", "") + " . " + r.get("body", "")
+        if token not in blob.lower():
+            continue
+        rv, em = parse_revenue(blob), parse_employees(blob)
+        if rv:
+            revs.append((rv, site, href))
+        if em:
+            emps.append((em, site, href))
     if emps:
         info["emp"], info["emp_src"], info["link"] = emps[0][0], emps[0][1], emps[0][2]
     if revs:
@@ -620,8 +619,33 @@ def enrich(company):
         if not info["link"]:
             info["link"] = revs[0][2]
     sources = {x[1] for x in emps + revs}
-    info["confidence"] = "Medium" if len(sources) >= 2 else "Low"
+    info["confidence"] = "Medium" if len(sources) >= 2 else ("Low" if sources else "")
     return info
+
+
+def enrich_many(rows, status, budget):
+    start = time.time()
+    infos = {}
+
+    def work(r):
+        if time.time() - start > budget:
+            return r["_key"], None
+        time.sleep(0.3)
+        return r["_key"], enrich(r["Company"], r.get("City", ""), r.get("State", ""))
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = [ex.submit(work, r) for r in rows]
+        for f in as_completed(futures):
+            try:
+                k, info = f.result()
+            except Exception:
+                k, info = None, None
+            if k is not None and info is not None:
+                infos[k] = info
+            done += 1
+            status.write(f"Step 3: size/revenue andaza {done}/{len(rows)} (hadd {budget} second)")
+    return infos
 
 
 def overlaps(lo, hi, min_v, max_v):
@@ -868,8 +892,8 @@ def mkrec(key, name, domain, src):
 # ---------- source 1: Overture Maps ----------
 def ov_connect():
     con = duckdb.connect()
-    for stmt in ("SET memory_limit='700MB'", "SET threads=4", "INSTALL httpfs", "LOAD httpfs",
-                 "SET s3_region='us-west-2'"):
+    for stmt in ("SET memory_limit='500MB'", "SET threads=4", "SET preserve_insertion_order=false",
+                 "INSTALL httpfs", "LOAD httpfs", "SET s3_region='us-west-2'"):
         try:
             con.execute(stmt)
         except Exception:
@@ -912,7 +936,7 @@ def ov_setup():
     return False
 
 
-def ov_fetch(tile, patterns, limit=40000):
+def ov_fetch(tile, patterns, limit=30000):
     cols = OV_STATE["cols"]
     cat = next((f"{c}.primary" for c in ("categories", "taxonomy") if c in cols), None)
     if not cat:
@@ -967,7 +991,7 @@ def discover_overture(patterns, locations, country, cc, goal, status, budget, kn
         if not bbox:
             notes.append(f"{loc}: Overture ke liye area ka naqsha nahi mila")
             continue
-        tiles = make_tiles(bbox)
+        tiles = make_tiles(bbox, 6.0)
         failed, last_err = 0, ""
         for ti, tile in enumerate(tiles):
             if time.time() - start > budget:
@@ -975,6 +999,7 @@ def discover_overture(patterns, locations, country, cc, goal, status, budget, kn
                 break
             if tile is None:
                 continue
+            status.write(f"Step 1: {label} | Overture | {loc} hissa {ti + 1}/{len(tiles)} check ho raha hai... | ab tak mili: {len(found) + len(known)}")
             rows, err = ov_fetch(tile, patterns)
             if rows is None:
                 failed += 1
@@ -1013,7 +1038,8 @@ def discover_overture(patterns, locations, country, cc, goal, status, budget, kn
                 if not domain and not (rec["phones"] or rec["emails"] or street):
                     continue
                 found[key] = rec
-            status.write(f"Step 1: {label} | Overture | {loc} hissa {ti + 1}/{len(tiles)} | mili: {len(found) + len(known)}")
+                if goal and len(found) + len(known) >= goal:
+                    break
             if goal and len(found) + len(known) >= goal:
                 break
         if failed:
@@ -1189,13 +1215,6 @@ def discover_web(niches, locations, country, kws, goal, status, budget, known, l
                 break
             time.sleep(0.4)
     return found
-
-
-def name_for_domain(domain):
-    html = fetch("https://" + domain)
-    if not html:
-        return None
-    return company_from_html(html, domain)
 
 
 # ---------- building rows ----------
@@ -1399,10 +1418,7 @@ def rows_to_df(rows, cols):
     return df[[c for c in cols if c in df.columns]]
 
 
-def show_results():
-    res = st.session_state.get("res")
-    if not res:
-        return
+def render_results(res, kp):
     cols = res.get("cols", ALL_COLS)
     if res.get("stats"):
         st.success(res["stats"])
@@ -1413,11 +1429,11 @@ def show_results():
     if rows:
         df = rows_to_df(rows, cols)
         st.dataframe(df, use_container_width=True)
-        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8-sig"), "leads.csv", key="dl_master")
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8-sig"), "leads.csv", key=kp + "_dl_master")
         if res["people"]:
             pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
             st.download_button("Download People CSV (har banda ek row)",
-                               pdf.to_csv(index=False).encode("utf-8-sig"), "people.csv", key="dl_people")
+                               pdf.to_csv(index=False).encode("utf-8-sig"), "people.csv", key=kp + "_dl_people")
     elif unknown:
         st.info("Aap ki range mein data-wali koi company match nahi hui. Neeche wo companies hain jin ka size/revenue data nahi mila.")
     else:
@@ -1427,10 +1443,16 @@ def show_results():
         udf = rows_to_df(unknown, cols)
         st.dataframe(udf, use_container_width=True)
         st.download_button("Download CSV (data nahi mila wali)", udf.to_csv(index=False).encode("utf-8-sig"),
-                           "leads_unknown.csv", key="dl_unknown")
+                           "leads_unknown.csv", key=kp + "_dl_unknown")
     if res["failed"]:
         with st.expander(f"{len(res['failed'])} skip hui (website khuli nahi, niche ya location se match nahi)"):
             st.write(", ".join(res["failed"]))
+
+
+def show_results():
+    res = st.session_state.get("res")
+    if res:
+        render_results(res, "main")
 
 
 def read_sites_csv(up):
@@ -1448,13 +1470,145 @@ def manual_rec(url, hint=""):
     return mkrec(d, hint, d, "Manual")
 
 
+# ---------- main search pipeline ----------
+def run_search(cfg):
+    t0 = time.time()
+    groups, locations, country, cc = cfg["groups"], cfg["locations"], cfg["country"], cfg["cc"]
+    per_group, wants, filt = cfg["per_group"], cfg["wants"], cfg["filt"]
+    filters_on = any(filt)
+    deep = bool(wants["email"] or wants["phone"] or wants["people"])
+    emails_on, people_on = bool(wants["email"]), bool(wants["people"])
+    status = st.empty()
+    budget = 1200 if per_group > 300 else 600
+    want_states = wanted_states(locations)
+
+    ov_ok = ov_setup()
+    notes = []
+    if ov_ok:
+        st.caption(f"Data source check: Overture Maps OK (release {OV_STATE['rel']})")
+    else:
+        st.caption("Data source check: Overture nahi khuli (" + OV_STATE["err"] + "). OpenStreetMap se kaam chalega.")
+
+    all_found, stat_lines = {}, []
+    for g in groups:
+        label = g["label"] or g["q"]
+        goal_g = math.ceil(per_group * 1.25) if per_group else DEFAULT_CAP
+        enough = goal_g if per_group else 30
+        f_all = {}
+        n_ov = n_osm = n_web = 0
+        if ov_ok:
+            f_ov, nts = discover_overture(g["ov"], locations, country, cc, goal_g, status, budget,
+                                          set(all_found), label)
+            notes += nts
+            f_all.update(f_ov)
+            n_ov = len(f_ov)
+        short = len(f_all) < enough
+        if g["tags"] and short:
+            f_site, nts = discover_osm(g["tags"], locations, country, goal_g, status, budget, True,
+                                       set(f_all) | set(all_found), label)
+            notes += nts
+            f_all.update(f_site)
+            n_osm += len(f_site)
+            short = len(f_all) < enough
+            if short:
+                f_ns, nts2 = discover_osm(g["tags"], locations, country, goal_g, status, budget, False,
+                                          set(f_all) | set(all_found), label)
+                notes += nts2
+                f_all.update(f_ns)
+                n_osm += len(f_ns)
+                short = len(f_all) < enough
+        if short:
+            f_web = discover_web([g["q"]], locations, country, g["kws"], goal_g, status, 120,
+                                 set(f_all) | set(all_found), label, want_states)
+            f_all.update(f_web)
+            n_web = len(f_web)
+        for k, v in f_all.items():
+            v["group"] = g["label"] or g["q"]
+            if not v["country"] and cc:
+                v["country"] = cc
+            all_found.setdefault(k, v)
+        stat_lines.append(f"{label}: {len(f_all)} mili (Overture {n_ov}, OpenStreetMap {n_osm}, web search {n_web})")
+
+    if not all_found:
+        st.error("Koi company nahi mili. " + " | ".join(notes) + " Niche ya location saaf likh kar dobara try karo, ya 2-3 minute baad dobara.")
+        return
+    st.caption(f"Milestone 1: {len(all_found)} companies mili ({int(time.time() - t0)} second). " + " | ".join(stat_lines))
+
+    recs = list(all_found.values())[:HARD_CAP]
+    res = run_batch(recs, deep, emails_on, people_on, people_on and len(recs) <= 25, status)
+    res["rows"].sort(key=lambda r: r["_score"], reverse=True)
+    st.caption(f"Milestone 2: {len(res['rows'])} companies ka data tayyar ({int(time.time() - t0)} second)")
+    res["notes"] = notes
+    res["cols"] = cols_for(wants, filt)
+
+    need_enrich = filters_on or wants["revenue"] or wants["employees"]
+    if not need_enrich:
+        res["rows"] = trim_rows(res["rows"], per_group)
+        counts = {}
+        for r in res["rows"]:
+            counts[r.get("Niche", "")] = counts.get(r.get("Niche", ""), 0) + 1
+        res["stats"] = "Search: " + " | ".join(stat_lines) + " || Final CSV: " + (
+            ", ".join(f"{k or 'sab'}: {v}" for k, v in counts.items()) or "0")
+        st.session_state["res"] = res
+        status.write(f"Mukammal! ({int(time.time() - t0)} second)")
+        return
+
+    # basic list pehle dikha do, phir size/revenue check
+    base_rows = trim_rows(list(res["rows"]), per_group) if not filters_on else list(res["rows"])
+    holder = st.empty()
+    interim = dict(res)
+    interim["rows"] = base_rows[:500]
+    interim["unknown"] = []
+    interim["stats"] = (f"Abhi size/revenue check ho raha hai. Neeche companies ki basic list hai ({len(base_rows)}). "
+                        "Check ke baad ye table update ho jayegi.")
+    with holder.container():
+        render_results(interim, "tmp")
+
+    targets = base_rows[:ENRICH_CAP]
+    infos = enrich_many(targets, status, ENRICH_SECONDS)
+
+    if filters_on:
+        match, unknown = [], []
+        for row in res["rows"]:
+            info = infos.get(row["_key"])
+            if info is None:
+                apply_info(row, empty_info())
+                row["Confidence"] = "Not checked"
+                unknown.append(row)
+                continue
+            apply_info(row, info)
+            if out_of_range(info, *filt):
+                continue
+            if passes(info, *filt):
+                match.append(row)
+            else:
+                unknown.append(row)
+        res["rows"] = trim_rows(match, per_group)
+        res["unknown"] = trim_rows(unknown, per_group)
+        res["stats"] = (f"Search: {' | '.join(stat_lines)} || Range match: {len(res['rows'])} | "
+                        f"Data nahi mila / check nahi hua (alag list): {len(res['unknown'])} | "
+                        f"jaanch hui: {len(infos)} companies ({int(time.time() - t0)} second)")
+    else:
+        res["rows"] = base_rows
+        for row in res["rows"]:
+            info = infos.get(row["_key"])
+            apply_info(row, info if info is not None else empty_info())
+        res["stats"] = (f"Search: {' | '.join(stat_lines)} || Final CSV: {len(res['rows'])} | "
+                        f"size/revenue check hua: {len(infos)} companies ({int(time.time() - t0)} second)")
+
+    holder.empty()
+    st.session_state["res"] = res
+    status.write("Mukammal!")
+
+
 # ---------- UI ----------
 tab_search, tab_bulk, tab_single = st.tabs(["Client description search", "Bulk websites", "Single website"])
 
 with tab_search:
     st.write("Client ki need likho: niche, country/state/city, kitni companies (jaise `100 each`). "
              "Default mein Website, Company, Address, Socials aur Phone milta hai. Email, people, revenue, "
-             "employees tab aate hain jab aap description mein likho (jaise `with email`, `with revenue`, `employees 10-50`).")
+             "employees tab aate hain jab aap description mein likho (jaise `with email`, `with revenue`, `employees 10-50`). "
+             "Count na likho to har niche ki lagbhag 300 companies tak ruk jata hai.")
     desc = st.text_area("Client description", height=130,
                         placeholder="Dentists in Austin, Texas. 100 companies. With employee size")
 
@@ -1559,7 +1713,7 @@ with tab_search:
         st.caption(
             f"Locations: {', '.join(locations) or country or 'koi nahi'} | Country code: {cc or '-'} | "
             f"Niches: {', '.join(g['label'] or g['q'] for g in groups) or '-'} | "
-            f"Har niche ka target: {per_group or 'jitni mil jayen sab'} | "
+            f"Har niche ka target: {per_group or f'lagbhag {DEFAULT_CAP}'} | "
             f"Extra data: {', '.join(extras) or 'koi nahi (sirf default)'} | "
             f"Employees filter: {d_emp_min or '-'} se {d_emp_max or 'upar'} | Revenue filter ($M): {d_rev_min or '-'} se {d_rev_max or 'upar'}"
         )
@@ -1567,128 +1721,15 @@ with tab_search:
     if st.button("Dhoondo", key="search_btn") and desc.strip():
         if not groups:
             st.error("Niche samajh nahi aaya. Description mein business type saaf likho (jaise dental, real estate).")
-            st.stop()
-
-        filters_on = bool(d_emp_min or d_emp_max or d_rev_min or d_rev_max)
-        deep = bool(wants["email"] or wants["phone"] or wants["people"])
-        emails_on = bool(wants["email"])
-        people_on = bool(wants["people"])
-        status = st.empty()
-        budget = 1200 if per_group > 300 else 600
-        want_states = wanted_states(locations)
-
-        ov_ok = ov_setup()
-        notes = []
-        if ov_ok:
-            st.caption(f"Data source check: Overture Maps OK (release {OV_STATE['rel']})")
         else:
-            st.caption("Data source check: Overture nahi khuli (" + OV_STATE["err"] + "). OpenStreetMap se kaam chalega.")
-
-        all_found, stat_lines = {}, []
-        for g in groups:
-            label = g["label"] or g["q"]
-            goal_g = math.ceil(per_group * 1.25) if per_group else 0
-            f_all = {}
-            n_ov = n_osm = n_web = 0
-            if ov_ok:
-                f_ov, nts = discover_overture(g["ov"], locations, country, cc, goal_g, status, budget,
-                                              set(all_found), label)
-                notes += nts
-                f_all.update(f_ov)
-                n_ov = len(f_ov)
-            short = (goal_g and len(f_all) < goal_g) or (not goal_g and len(f_all) < 30)
-            if g["tags"] and short:
-                f_site, nts = discover_osm(g["tags"], locations, country, goal_g, status, budget, True,
-                                           set(f_all) | set(all_found), label)
-                notes += nts
-                f_all.update(f_site)
-                n_osm += len(f_site)
-                short = (goal_g and len(f_all) < goal_g) or (not goal_g and len(f_all) < 30)
-                if short:
-                    f_ns, nts2 = discover_osm(g["tags"], locations, country, goal_g, status, budget, False,
-                                              set(f_all) | set(all_found), label)
-                    notes += nts2
-                    f_all.update(f_ns)
-                    n_osm += len(f_ns)
-                    short = (goal_g and len(f_all) < goal_g) or (not goal_g and len(f_all) < 30)
-            if short:
-                f_web = discover_web([g["q"]], locations, country, g["kws"], goal_g, status, 120,
-                                     set(f_all) | set(all_found), label, want_states)
-                f_all.update(f_web)
-                n_web = len(f_web)
-            for k, v in f_all.items():
-                v["group"] = g["label"] or g["q"]
-                if not v["country"] and cc:
-                    v["country"] = cc
-                all_found.setdefault(k, v)
-            stat_lines.append(f"{label}: {len(f_all)} mili (Overture {n_ov}, OpenStreetMap {n_osm}, web search {n_web})")
-
-        if not all_found:
-            st.error("Koi company nahi mili. " + " | ".join(notes) + " Niche ya location saaf likh kar dobara try karo, ya 2-3 minute baad dobara.")
-            st.stop()
-
-        recs = list(all_found.values())[:HARD_CAP]
-
-        infos = {}
-        unknown_keys = set()
-        if filters_on:
-            cand = recs[:ENRICH_CAP]
-            need = [r for r in cand if not r["name"]]
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                futs = {ex.submit(name_for_domain, r["domain"]): r for r in need if r["domain"]}
-                for f in as_completed(futs):
-                    futs[f]["name"] = f.result() or ""
-            kept = []
-            bar2 = st.progress(0.0)
-            cand = [r for r in cand if r["name"]]
-            for n, r in enumerate(cand):
-                status.write(f"Step 1c: size/revenue check {n + 1}/{len(cand)}: {r['name']}")
-                bar2.progress((n + 1) / max(len(cand), 1))
-                info = enrich(r["name"])
-                infos[r["key"]] = info
-                if out_of_range(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max):
-                    continue
-                kept.append(r)
-                if not passes(info, d_emp_min, d_emp_max, d_rev_min, d_rev_max):
-                    unknown_keys.add(r["key"])
-            recs = kept
-
-        if not recs:
-            st.session_state["res"] = None
-            st.warning("Jin companies ka data mila wo sab aap ki range se bahar thin. Range wider karo.")
-        else:
-            res = run_batch(recs, deep, emails_on, people_on, people_on and len(recs) <= 25, status)
-            res["unknown"] = [r for r in res["rows"] if r["_key"] in unknown_keys]
-            res["rows"] = [r for r in res["rows"] if r["_key"] not in unknown_keys]
-            res["rows"].sort(key=lambda r: r["_score"], reverse=True)
-            res["unknown"].sort(key=lambda r: r["_score"], reverse=True)
-            res["rows"] = trim_rows(res["rows"], per_group)
-            res["unknown"] = trim_rows(res["unknown"], per_group)
-
-            for row in res["rows"] + res["unknown"]:
-                info = infos.get(row["_key"])
-                if info is not None:
-                    apply_info(row, info)
-
-            if wants["revenue"] or wants["employees"]:
-                todo = [r for r in res["rows"] if r["_key"] not in infos][:200]
-                for n, row in enumerate(todo):
-                    status.write(f"Step 3: size/revenue andaza {n + 1}/{len(todo)}: {row['Company']}")
-                    apply_info(row, enrich(row["Company"]))
-
-            res["notes"] = notes
-            res["cols"] = cols_for(wants, (d_emp_min, d_emp_max, d_rev_min, d_rev_max))
-            final_counts = {}
-            for r in res["rows"]:
-                final_counts[r.get("Niche", "")] = final_counts.get(r.get("Niche", ""), 0) + 1
-            stats = "Search: " + " | ".join(stat_lines) + " || Final CSV: " + (
-                ", ".join(f"{k or 'sab'}: {v}" for k, v in final_counts.items()) or "0")
-            if filters_on:
-                stats += (f" || Range match: {len(res['rows'])} | Data nahi mila (alag list): {len(res['unknown'])}"
-                          f" | jaanch hui: {min(len(all_found), ENRICH_CAP)} companies")
-            res["stats"] = stats
-            st.session_state["res"] = res
-            status.write("Mukammal!")
+            cfg = {"groups": groups, "locations": locations, "country": country, "cc": cc,
+                   "per_group": per_group, "wants": wants,
+                   "filt": (d_emp_min, d_emp_max, d_rev_min, d_rev_max)}
+            try:
+                run_search(cfg)
+            except Exception as e:
+                st.error("Run beech mein ruk gaya. Ye error screenshot mein bhej do:")
+                st.exception(e)
 
 with tab_bulk:
     st.write("Har line mein ek website. Company ka naam dena ho to comma lagao: `example.com, Example Corp`. Is tab mein email, phone, people sab nikalte hain.")
