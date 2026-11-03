@@ -37,8 +37,8 @@ st.caption("Built by Faiz Khan")
 WORKERS = 16
 HARD_CAP = 3000
 DEFAULT_CAP = 300
-ENRICH_CAP = 80
-ENRICH_SECONDS = 240
+ENRICH_CAP = 120
+ENRICH_SECONDS = 420
 SEARCH_LOCK = threading.Lock()
 OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
             "https://overpass.private.coffee/api/interpreter"]
@@ -88,7 +88,8 @@ TITLE_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in TITLES) + r")\b", 
 
 INFO_SITES = ["growjo.com", "zoominfo.com", "zippia.com", "dnb.com", "cortera.com",
               "rocketreach.co", "apollo.io", "linkedin.com/company", "craft.co",
-              "owler.com", "leadiq.com", "comparably.com"]
+              "owler.com", "leadiq.com", "comparably.com", "manta.com", "buzzfile.com",
+              "bbb.org", "datanyze.com", "cbinsights.com", "tracxn.com"]
 BLOCK_DOMAINS = ["yelp.", "facebook.", "instagram.", "linkedin.", "tripadvisor.", "yellowpages.",
                  "mapquest.", "realself.", "groupon.", "healthgrades.", "zocdoc.", "wikipedia.",
                  "wiktionary.", "youtube.", "tiktok.", "reddit.", "pinterest.", "nytimes.", "timeout.",
@@ -194,8 +195,12 @@ GENERIC_WORDS = {"company", "companies", "services", "service", "near", "best", 
 UNIT = r"(?:billion|million|thousand|bn|mm|b|m|k)"
 MONEY_RE = re.compile(r"\$\s?(\d[\d,]*\.?\d*)\s*(billion|million|thousand|bn|mm|b|m|k)?\b", re.I)
 MONEY_UNIT_RE = re.compile(r"\$?\s?(\d[\d,]*\.?\d*)\s*(billion|million|thousand|bn|mm|k|m|b)\b", re.I)
-EMP_RANGE_RE = re.compile(r"(\d[\d,]*)\s*(?:-|–|to)\s*(\d[\d,]*)\+?\s*(?:employees|staff|team members)", re.I)
-EMP_ONE_RE = re.compile(r"(\d[\d,]*)\+?\s*(?:employees|staff)", re.I)
+EMP_RANGE_RE = re.compile(r"(\d[\d,]*)\s*(?:-|–|to)\s*(\d[\d,]*)\+?\s*(?:employees?|staff|team members?|workers)", re.I)
+EMP_ONE_RE = re.compile(r"(\d[\d,]*)\+?\s*(?:employees?|staff|workers)", re.I)
+EMP_LABEL_RE = re.compile(
+    r"(?:number of employees|employees?|staff|company size|team size)\s*(?:count)?\s*[:\-]?\s*(\d[\d,]*)\s*(?:-|–|to)\s*(\d[\d,]*)",
+    re.I)
+EMP_LABEL_ONE_RE = re.compile(r"(?:number of employees|employees?|staff)\s*[:\-]\s*(\d[\d,]*)\b", re.I)
 REV_WORD_RE = r"rev[ei]n[ue]+\b|sales|turnover"
 
 
@@ -545,9 +550,14 @@ def fmt_emp(emp):
     return str(emp[0]) if emp[0] == emp[1] else f"{emp[0]}-{emp[1]}"
 
 
-def parse_revenue(text):
+def snippet(text, start, end, pad=50):
+    return " ".join(text[max(0, start - pad): end + pad].split())[:170]
+
+
+def parse_revenue_ev(text):
     for m in re.finditer(REV_WORD_RE, text, re.I):
-        window = text[max(0, m.start() - 60): m.end() + 140]
+        ws = max(0, m.start() - 60)
+        window = text[ws: m.end() + 140]
         found = []
         for mm in MONEY_UNIT_RE.finditer(window):
             val = to_usd_m(mm.group(1), mm.group(2))
@@ -563,28 +573,47 @@ def parse_revenue(text):
             continue
         found.sort(key=lambda x: x[1])
         lo = hi = found[0][0]
+        last_end = found[0][2]
         if len(found) > 1:
             gap = window[found[0][2]: found[1][1]]
             if len(gap) <= 8:
                 lo, hi = min(found[0][0], found[1][0]), max(found[0][0], found[1][0])
-        return (lo, hi)
-    return None
+                last_end = found[1][2]
+        return (lo, hi), " ".join(window[: last_end + 20].split())[:170]
+    return None, ""
+
+
+def parse_revenue(text):
+    return parse_revenue_ev(text)[0]
+
+
+def parse_employees_ev(text):
+    for rx, kind in ((EMP_RANGE_RE, "r"), (EMP_LABEL_RE, "r"), (EMP_ONE_RE, "o"), (EMP_LABEL_ONE_RE, "o")):
+        m = rx.search(text)
+        if not m:
+            continue
+        try:
+            if kind == "r":
+                a, b = int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
+                val = (min(a, b), max(a, b))
+            else:
+                n = int(m.group(1).replace(",", ""))
+                val = (n, n)
+        except Exception:
+            continue
+        if val[1] > 500000:
+            continue
+        return val, snippet(text, m.start(), m.end())
+    return None, ""
 
 
 def parse_employees(text):
-    m = EMP_RANGE_RE.search(text)
-    if m:
-        a, b = int(m.group(1).replace(",", "")), int(m.group(2).replace(",", ""))
-        return (min(a, b), max(a, b))
-    m = EMP_ONE_RE.search(text)
-    if m:
-        n = int(m.group(1).replace(",", ""))
-        return (n, n)
-    return None
+    return parse_employees_ev(text)[0]
 
 
 def empty_info():
-    return {"emp": None, "rev": None, "emp_src": "", "rev_src": "", "link": "", "confidence": ""}
+    return {"emp": None, "rev": None, "emp_src": "", "rev_src": "", "emp_link": "", "rev_link": "",
+            "emp_ev": "", "rev_ev": "", "emp_loc": False, "rev_loc": False, "confidence": ""}
 
 
 def enrich(company, city="", state=""):
@@ -593,33 +622,46 @@ def enrich(company, city="", state=""):
         return info
     words = [w for w in company.lower().split() if w not in ("the", "a", "and")]
     token = words[0] if words else company.lower()
+    city_l = (city or "").lower().strip()
     emps, revs = [], []
-    q = " ".join(x for x in [company, city, state, "revenue employees"] if x)
-    try:
-        results = DDGS().text(q, region="us-en", max_results=10)
-    except Exception:
-        results = []
-    for r in results or []:
-        href = r.get("href", "")
-        site = next((s for s in INFO_SITES if s in href), None)
-        if not site:
-            continue
-        blob = r.get("title", "") + " . " + r.get("body", "")
-        if token not in blob.lower():
-            continue
-        rv, em = parse_revenue(blob), parse_employees(blob)
-        if rv:
-            revs.append((rv, site, href))
-        if em:
-            emps.append((em, site, href))
+    queries = [
+        " ".join(x for x in [company, city, state, "employees revenue"] if x),
+        " ".join(x for x in [company, city, state, "company size employees linkedin"] if x),
+    ]
+    for qi, q in enumerate(queries):
+        if qi == 1 and emps and revs:
+            break
+        try:
+            results = DDGS().text(q, region="us-en", max_results=10)
+        except Exception:
+            results = []
+        for r in results or []:
+            href = r.get("href", "")
+            site = next((s for s in INFO_SITES if s in href), None)
+            if not site:
+                continue
+            blob = r.get("title", "") + " . " + r.get("body", "")
+            low = blob.lower()
+            if token not in low:
+                continue
+            loc_ok = bool(city_l and city_l in low)
+            rv, rv_ev = parse_revenue_ev(blob)
+            em, em_ev = parse_employees_ev(blob)
+            if rv:
+                revs.append((loc_ok, rv, site, href, rv_ev))
+            if em:
+                emps.append((loc_ok, em, site, href, em_ev))
+        time.sleep(0.2)
+    emps.sort(key=lambda x: not x[0])
+    revs.sort(key=lambda x: not x[0])
     if emps:
-        info["emp"], info["emp_src"], info["link"] = emps[0][0], emps[0][1], emps[0][2]
+        ok, em, site, href, ev = emps[0]
+        info.update(emp=em, emp_src=site, emp_link=href, emp_ev=ev, emp_loc=ok)
     if revs:
-        info["rev"], info["rev_src"] = revs[0][0], revs[0][1]
-        if not info["link"]:
-            info["link"] = revs[0][2]
-    sources = {x[1] for x in emps + revs}
-    info["confidence"] = "Medium" if len(sources) >= 2 else ("Low" if sources else "")
+        ok, rv, site, href, ev = revs[0]
+        info.update(rev=rv, rev_src=site, rev_link=href, rev_ev=ev, rev_loc=ok)
+    if emps or revs:
+        info["confidence"] = "Medium (city match)" if (info["emp_loc"] or info["rev_loc"]) else "Low (city match nahi)"
     return info
 
 
@@ -630,7 +672,6 @@ def enrich_many(rows, status, budget):
     def work(r):
         if time.time() - start > budget:
             return r["_key"], None
-        time.sleep(0.3)
         return r["_key"], enrich(r["Company"], r.get("City", ""), r.get("State", ""))
 
     done = 0
@@ -1370,10 +1411,11 @@ def run_batch(recs, deep, emails_on, people_on, use_search, status):
 
 def apply_info(row, info):
     row["Employees"] = fmt_emp(info["emp"])
-    row["Employees source"] = info["emp_src"]
+    row["Employees evidence"] = info["emp_ev"]
+    row["Employees link"] = info["emp_link"]
     row["Revenue (Estimate)"] = fmt_rev(info["rev"])
-    row["Revenue source"] = info["rev_src"]
-    row["Source link"] = info["link"]
+    row["Revenue evidence"] = info["rev_ev"]
+    row["Revenue link"] = info["rev_link"]
     row["Confidence"] = info["confidence"]
 
 
@@ -1396,12 +1438,14 @@ def cols_for(wants, d_filters):
         cols.append("Emails")
     if wants.get("people"):
         cols.append("People (name - title)")
-    if wants.get("employees") or d_filters[0] or d_filters[1]:
-        cols += ["Employees", "Employees source"]
-    if wants.get("revenue") or d_filters[2] or d_filters[3]:
-        cols += ["Revenue (Estimate)", "Revenue source"]
-    if any(c in cols for c in ("Employees", "Revenue (Estimate)")):
-        cols += ["Source link", "Confidence"]
+    emp_on = wants.get("employees") or d_filters[0] or d_filters[1]
+    rev_on = wants.get("revenue") or d_filters[2] or d_filters[3]
+    if emp_on:
+        cols += ["Employees", "Employees evidence", "Employees link"]
+    if rev_on:
+        cols += ["Revenue (Estimate)", "Revenue evidence", "Revenue link"]
+    if emp_on or rev_on:
+        cols.append("Confidence")
     return cols + ["Category", "Source"]
 
 
@@ -1418,6 +1462,17 @@ def rows_to_df(rows, cols):
     return df[[c for c in cols if c in df.columns]]
 
 
+def link_config(df):
+    cfg = {}
+    try:
+        for c in df.columns:
+            if c in ("Employees link", "Revenue link") or c in SOCIAL_COLS:
+                cfg[c] = st.column_config.LinkColumn()
+    except Exception:
+        cfg = {}
+    return cfg
+
+
 def render_results(res, kp):
     cols = res.get("cols", ALL_COLS)
     if res.get("stats"):
@@ -1428,7 +1483,7 @@ def render_results(res, kp):
     unknown = res.get("unknown") or []
     if rows:
         df = rows_to_df(rows, cols)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, column_config=link_config(df))
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8-sig"), "leads.csv", key=kp + "_dl_master")
         if res["people"]:
             pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
@@ -1441,7 +1496,7 @@ def render_results(res, kp):
     if unknown:
         st.subheader(f"Size/revenue ka data nahi mila ({len(unknown)} companies, aap khud check kar lo)")
         udf = rows_to_df(unknown, cols)
-        st.dataframe(udf, use_container_width=True)
+        st.dataframe(udf, use_container_width=True, column_config=link_config(udf))
         st.download_button("Download CSV (data nahi mila wali)", udf.to_csv(index=False).encode("utf-8-sig"),
                            "leads_unknown.csv", key=kp + "_dl_unknown")
     if res["failed"]:
@@ -1553,19 +1608,21 @@ def run_search(cfg):
         status.write(f"Mukammal! ({int(time.time() - t0)} second)")
         return
 
-    # basic list pehle dikha do, phir size/revenue check
     base_rows = trim_rows(list(res["rows"]), per_group) if not filters_on else list(res["rows"])
     holder = st.empty()
     interim = dict(res)
     interim["rows"] = base_rows[:500]
     interim["unknown"] = []
-    interim["stats"] = (f"Abhi size/revenue check ho raha hai. Neeche companies ki basic list hai ({len(base_rows)}). "
-                        "Check ke baad ye table update ho jayegi.")
+    interim["stats"] = (f"Abhi size/revenue check ho raha hai (7 minute tak). Neeche companies ki basic list hai ({len(base_rows)}). "
+                        "Check ke baad ye table update ho jayegi aur Employees/Revenue ke columns bhar jayenge.")
     with holder.container():
         render_results(interim, "tmp")
 
     targets = base_rows[:ENRICH_CAP]
     infos = enrich_many(targets, status, ENRICH_SECONDS)
+    n_emp = sum(1 for i in infos.values() if i["emp"])
+    n_rev = sum(1 for i in infos.values() if i["rev"])
+    found_txt = f"Employees ka data {n_emp}/{len(targets)} companies ka mila, revenue ka {n_rev}/{len(targets)}"
 
     if filters_on:
         match, unknown = [], []
@@ -1585,16 +1642,16 @@ def run_search(cfg):
                 unknown.append(row)
         res["rows"] = trim_rows(match, per_group)
         res["unknown"] = trim_rows(unknown, per_group)
-        res["stats"] = (f"Search: {' | '.join(stat_lines)} || Range match: {len(res['rows'])} | "
-                        f"Data nahi mila / check nahi hua (alag list): {len(res['unknown'])} | "
-                        f"jaanch hui: {len(infos)} companies ({int(time.time() - t0)} second)")
+        res["stats"] = (f"Search: {' | '.join(stat_lines)} || {found_txt} || Range match: {len(res['rows'])} | "
+                        f"Data nahi mila / check nahi hua (alag list): {len(res['unknown'])} "
+                        f"({int(time.time() - t0)} second)")
     else:
         res["rows"] = base_rows
         for row in res["rows"]:
             info = infos.get(row["_key"])
             apply_info(row, info if info is not None else empty_info())
-        res["stats"] = (f"Search: {' | '.join(stat_lines)} || Final CSV: {len(res['rows'])} | "
-                        f"size/revenue check hua: {len(infos)} companies ({int(time.time() - t0)} second)")
+        res["stats"] = (f"Search: {' | '.join(stat_lines)} || {found_txt} || Final CSV: {len(res['rows'])} "
+                        f"({int(time.time() - t0)} second)")
 
     holder.empty()
     st.session_state["res"] = res
@@ -1668,10 +1725,12 @@ with tab_search:
                 if extra:
                     groups.append({"label": "other", "tags": extra, "kws": [], "q": niches[0],
                                    "ov": ov_fallback(niches[0])})
-                d_emp_min = int(ai.get("emp_min", 0) or 0)
-                d_emp_max = int(ai.get("emp_max", 0) or 0)
-                d_rev_min = float(ai.get("rev_min_m", 0) or 0)
-                d_rev_max = float(ai.get("rev_max_m", 0) or 0)
+                if not (d_emp_min or d_emp_max):
+                    d_emp_min = int(ai.get("emp_min", 0) or 0)
+                    d_emp_max = int(ai.get("emp_max", 0) or 0)
+                if not (d_rev_min or d_rev_max):
+                    d_rev_min = float(ai.get("rev_min_m", 0) or 0)
+                    d_rev_max = float(ai.get("rev_max_m", 0) or 0)
                 st.success("AI ne description samjhi. Niches: " + " | ".join(niches)
                            + (" | Locations: " + ", ".join(locations) if locations else "")
                            + (f" | Country: {country}" if country else ""))
