@@ -122,7 +122,7 @@ STATE_LIST = [
 ]
 STATE_BY_NAME = {n.lower(): c for n, c in STATE_LIST}
 CODE2NAME = {c: n for n, c in STATE_LIST}
-AMBIGUOUS_CODES = {"IN", "OR", "ME", "OK", "HI"}
+AMBIGUOUS_CODES = {"IN", "OR", "ME", "OK", "HI", "LA", "ID", "CO", "AL", "DE"}
 US_NAMES = ("usa", "us", "u.s.", "u.s.a.", "united states", "united states of america", "america")
 ALIASES = {"nyc": "New York City", "la": "Los Angeles", "sf": "San Francisco"}
 CITY_TO_STATE = {
@@ -470,21 +470,118 @@ def extract_profile(html):
     return out
 
 
+NAME_BAD = {
+    "team", "contact", "read", "more", "learn", "about", "services", "service", "home", "meet", "our",
+    "privacy", "terms", "policy", "dental", "dentist", "group", "office", "practice", "clinic", "company",
+    "director", "manager", "founder", "owner", "president", "chief", "officer", "executive", "partner",
+    "broker", "agent", "sales", "marketing", "support", "staff", "leadership", "management", "board",
+    "news", "blog", "careers", "career", "appointment", "request", "book", "call", "email", "phone",
+    "follow", "view", "all", "new", "patient", "patients", "welcome", "location", "locations", "hours",
+    "reviews", "testimonials", "gallery", "login", "menu", "search", "vice", "senior", "associate",
+    "assistant", "head", "general", "real", "estate", "law", "firm", "the", "and", "for", "with", "us",
+    "inc", "llc", "ltd", "page", "click", "here", "free", "get", "started", "copyright", "rights",
+}
+NAME_PARTICLES = {"van", "de", "der", "von", "bin", "al", "el", "da", "di", "la", "le", "del", "du"}
+SEP_RE = re.compile(r"\s+[-–—|•·:]\s+|,\s+|\s*\|\s*")
+CONF_RANK = {"High": 0, "Medium": 1, "Low": 2}
+COMMON_PATHS = ["/about", "/about-us", "/team", "/our-team", "/meet-the-team", "/leadership",
+                "/staff", "/management", "/contact", "/contact-us"]
+CO_STOP = {"the", "and", "inc", "llc", "ltd", "co", "corp", "company", "group", "of", "pllc", "pc"}
+
+
+def is_name(s):
+    s = (s or "").strip().strip(",.")
+    s = re.sub(r"^(Dr|Mr|Mrs|Ms|Prof)\.?\s+", "", s)
+    words = s.split()
+    if not (2 <= len(words) <= 4) or len(s) > 40:
+        return False
+    for i, w in enumerate(words):
+        wl = w.lower().strip(".")
+        if not re.fullmatch(r"[^\W\d_][\w'’.-]*", w):
+            return False
+        if wl in NAME_BAD:
+            return False
+        if wl in NAME_PARTICLES and 0 < i < len(words) - 1:
+            continue
+        if not w[0].isupper():
+            return False
+    return True
+
+
+def mk_person(name, title, source, link, evidence, conf):
+    return {"Name": name.strip(), "Title": title.strip(), "Source": source, "Link": link,
+            "Evidence": " ".join(evidence.split())[:200], "Confidence": conf}
+
+
+def dedupe_people(people):
+    out, seen = [], set()
+    for x in sorted(people, key=lambda p: CONF_RANK.get(p.get("Confidence"), 3)):
+        k = x["Name"].lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
+
+
 def extract_people(html, src):
     soup = BeautifulSoup(html, "html.parser")
-    lines = [l.strip() for l in soup.get_text("\n").split("\n") if l.strip()]
     found = []
+
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except Exception:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if "Person" in types:
+                nm = str(node.get("name") or "").strip()
+                jt = str(node.get("jobTitle") or "").strip()
+                if is_name(nm) and jt and len(jt) <= 60 and TITLE_RE.search(jt):
+                    found.append(mk_person(nm, jt, "Website (structured data)", src,
+                                           f"schema.org Person: {nm}, {jt}", "High"))
+            stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+
+    for s in soup(["script", "style", "noscript"]):
+        s.decompose()
+    lines = [l.strip() for l in soup.get_text("\n").split("\n") if l.strip()]
     for i, line in enumerate(lines):
-        if len(line) < 70 and TITLE_RE.search(line) and not NAME_RE.match(line):
+        if len(line) <= 90:
+            parts = [p.strip() for p in SEP_RE.split(line) if p.strip()]
+            if 2 <= len(parts) <= 4:
+                nm = next((p for p in parts if is_name(p)), None)
+                tt = next((p for p in parts if p != nm and len(p) <= 60 and TITLE_RE.search(p)
+                           and not is_name(p)), None)
+                if nm and tt:
+                    found.append(mk_person(nm, tt, "Website", src, line, "High"))
+                    continue
+        if len(line) < 70 and TITLE_RE.search(line) and not is_name(line.split(",")[0]):
             for j in (i - 1, i + 1):
-                if 0 <= j < len(lines) and NAME_RE.match(lines[j]):
-                    found.append({"Name": lines[j], "Title": line, "Source": "Website", "Link": src})
+                cand = lines[j].split(",")[0].strip() if 0 <= j < len(lines) else ""
+                if cand and is_name(cand) and not TITLE_RE.search(",".join(lines[j].split(",")[1:])):
+                    found.append(mk_person(cand, line, "Website", src, f"{lines[j]} / {line}", "High"))
                     break
     return found
 
 
+def company_tokens(company):
+    return [w for w in re.findall(r"[a-z0-9]{3,}", (company or "").lower()) if w not in CO_STOP]
+
+
 def search_people(company, domain, limit=10):
     if DDGS is None:
+        return []
+    toks = company_tokens(company)
+    if not toks:
         return []
     queries = [
         f'site:linkedin.com/in "{company}" (CEO OR Founder OR Owner OR President)',
@@ -501,15 +598,87 @@ def search_people(company, domain, limit=10):
                 href, title, body = r.get("href", ""), r.get("title", ""), r.get("body", "")
                 if "linkedin.com/in" not in href:
                     continue
-                blob = (title + " " + body).lower()
-                if company.lower().split()[0] not in blob:
-                    continue
-                t = title.replace("| LinkedIn", "").strip()
+                t = title.replace("| LinkedIn", "").replace("- LinkedIn", "").strip()
                 parts = [x.strip() for x in re.split(r" - | – | \| ", t) if x.strip()]
-                if len(parts) >= 2 and NAME_RE.match(parts[0]):
-                    out.append({"Name": parts[0], "Title": parts[1], "Source": "Web search", "Link": href})
+                if len(parts) < 2 or not is_name(parts[0]):
+                    continue
+                blob = (title + " " + body).lower()
+                hits = sum(1 for k in toks if k in blob)
+                if hits < max(1, math.ceil(len(toks) / 2)):
+                    continue
+                job = next((p for p in parts[1:] if TITLE_RE.search(p) and len(p) <= 70), None)
+                if not job:
+                    continue
+                out.append(mk_person(parts[0], job, "LinkedIn (search result)", href,
+                                     title + " - " + body, "Medium"))
             time.sleep(1)
     return out
+
+
+def site_search_people(company, domain):
+    """Company ki apni website ke team/leadership pages search se dhoondo jo menu mein link nahi the."""
+    if DDGS is None or not domain:
+        return []
+    q = f'site:{domain} (owner OR founder OR "meet the team" OR leadership OR "our team")'
+    urls = []
+    with SEARCH_LOCK:
+        try:
+            results = DDGS().text(q, max_results=8)
+        except Exception:
+            results = []
+        time.sleep(1)
+    for r in results or []:
+        href = r.get("href", "")
+        if urlparse(href).netloc.lower().replace("www.", "").endswith(domain) and href not in urls:
+            urls.append(href)
+    out = []
+    for u in urls[:3]:
+        h = fetch(u)
+        if h:
+            out += extract_people(h, u)
+    return out
+
+
+def fetch_site(domain):
+    for base in (f"https://{domain}", f"https://www.{domain}", f"http://{domain}"):
+        h = fetch(base)
+        if h:
+            return h, base
+    return None, ""
+
+
+def candidate_pages(base, pages, people_on):
+    order = (["team", "leadership", "management", "staff", "people", "about", "contact"] if people_on
+             else ["contact", "about", "team", "leadership", "management", "people", "staff"])
+
+    def pri(u):
+        low = u.lower()
+        for i, k in enumerate(order):
+            if k in low:
+                return i
+        return 99
+
+    ordered = sorted(pages, key=pri)
+    if people_on:
+        ordered += [urljoin(base.rstrip("/") + "/", p.lstrip("/")) for p in COMMON_PATHS]
+    out, seen = [], set()
+    for u in ordered:
+        u = u.rstrip("/")
+        if u in seen or u == base.rstrip("/"):
+            continue
+        seen.add(u)
+        out.append(u)
+    return out[: 8 if people_on else 3]
+
+
+def show_df(df, cfg=None):
+    cfg = cfg or {}
+    for kw in ({"width": "stretch"}, {"use_container_width": True}, {}):
+        try:
+            st.dataframe(df, column_config=cfg, **kw)
+            return
+        except Exception:
+            continue
 
 
 # ---------- size / revenue (sirf tab jab maango) ----------
@@ -1261,9 +1430,8 @@ def discover_web(niches, locations, country, kws, goal, status, budget, known, l
 # ---------- building rows ----------
 def build_row(rec, deep, emails_on, people_on, use_search):
     domain = rec["domain"]
-    base = "https://" + domain if domain else ""
-    html = fetch(base) if domain else None
     src = rec["src"]
+    html, base = fetch_site(domain) if domain else (None, "")
 
     if src == "Web search":
         if not html:
@@ -1282,8 +1450,7 @@ def build_row(rec, deep, emails_on, people_on, use_search):
         if people_on:
             people += extract_people(html, base)
         if deep:
-            ordered = sorted(pages, key=lambda u: 0 if "contact" in u.lower() else 1)
-            for pg in ordered[:3]:
+            for pg in candidate_pages(base, pages, people_on):
                 h = fetch(pg)
                 if h:
                     e2, p2, s2, _ = extract_contacts(h, pg)
@@ -1341,13 +1508,9 @@ def build_row(rec, deep, emails_on, people_on, use_search):
 
     if people_on and use_search:
         people += search_people(company, domain)
-    uniq, seen_n = [], set()
-    for x in people:
-        k = x["Name"].lower()
-        if k not in seen_n:
-            seen_n.add(k)
-            uniq.append(x)
-    people = uniq
+        if len(people) < 2:
+            people += site_search_people(company, domain)
+    people = dedupe_people(people)
 
     row = {
         "Website": domain,
@@ -1360,7 +1523,9 @@ def build_row(rec, deep, emails_on, people_on, use_search):
         "Country": rec.get("country", ""),
         "Phone": phones[0] if phones else "",
         "Emails": "; ".join(emails[:8]),
-        "People (name - title)": "; ".join(f"{x['Name']} - {x['Title']}" for x in people[:10]),
+        "People (name - title)": ("; ".join(f"{x['Name']} - {x['Title']}" for x in people[:10])
+                                  if people else ("Not found" if people_on else "")),
+        "People sources": "; ".join(f"{x['Name']}: {x['Link']}" for x in people[:10]),
         "Category": rec.get("category", ""),
         "Source": src,
         "_key": rec["key"],
@@ -1368,7 +1533,7 @@ def build_row(rec, deep, emails_on, people_on, use_search):
     for col in SOCIAL_COLS:
         row[col] = socials.get(col, "")
 
-    filled = [row["Street"], row["City"], row["Phone"], row["Emails"], row["People (name - title)"]]
+    filled = [row["Street"], row["City"], row["Phone"], row["Emails"], ("" if row["People (name - title)"] == "Not found" else row["People (name - title)"])]
     filled += [row[c] for c in SOCIAL_COLS]
     row["_score"] = sum(1 for v in filled if v)
     base_cols = {"Company": company, "Website": domain}
@@ -1437,7 +1602,7 @@ def cols_for(wants, d_filters):
     if wants.get("email"):
         cols.append("Emails")
     if wants.get("people"):
-        cols.append("People (name - title)")
+        cols += ["People (name - title)", "People sources"]
     emp_on = wants.get("employees") or d_filters[0] or d_filters[1]
     rev_on = wants.get("revenue") or d_filters[2] or d_filters[3]
     if emp_on:
@@ -1450,7 +1615,7 @@ def cols_for(wants, d_filters):
 
 
 ALL_COLS = ["Website", "Company", "Niche", "Street", "City", "State", "ZIP", "Country"] + SOCIAL_COLS + [
-    "Phone", "Emails", "People (name - title)", "Category", "Source"]
+    "Phone", "Emails", "People (name - title)", "People sources", "Category", "Source"]
 
 
 def rows_to_df(rows, cols):
@@ -1483,10 +1648,12 @@ def render_results(res, kp):
     unknown = res.get("unknown") or []
     if rows:
         df = rows_to_df(rows, cols)
-        st.dataframe(df, use_container_width=True, column_config=link_config(df))
+        show_df(df, link_config(df))
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8-sig"), "leads.csv", key=kp + "_dl_master")
         if res["people"]:
             pdf = pd.DataFrame(res["people"]).drop_duplicates(subset=["Website", "Name"])
+            st.subheader("Decision-makers (source link ke saath)")
+            show_df(pdf, {"Link": st.column_config.LinkColumn()})
             st.download_button("Download People CSV (har banda ek row)",
                                pdf.to_csv(index=False).encode("utf-8-sig"), "people.csv", key=kp + "_dl_people")
     elif unknown:
@@ -1496,7 +1663,7 @@ def render_results(res, kp):
     if unknown:
         st.subheader(f"Size/revenue ka data nahi mila ({len(unknown)} companies, aap khud check kar lo)")
         udf = rows_to_df(unknown, cols)
-        st.dataframe(udf, use_container_width=True, column_config=link_config(udf))
+        show_df(udf, link_config(udf))
         st.download_button("Download CSV (data nahi mila wali)", udf.to_csv(index=False).encode("utf-8-sig"),
                            "leads_unknown.csv", key=kp + "_dl_unknown")
     if res["failed"]:
@@ -1659,7 +1826,7 @@ def run_search(cfg):
 
 
 # ---------- UI ----------
-tab_search, tab_bulk, tab_single = st.tabs(["Client description search", "Bulk websites", "Single website"])
+tab_search, tab_bulk, tab_single, tab_any, tab_book = st.tabs(["Client description search", "Bulk websites", "Single website", "Any research task (AI)", "Booking prospects"])
 
 with tab_search:
     st.write("Client ki need likho: niche, country/state/city, kitni companies (jaise `100 each`). "
@@ -1688,10 +1855,22 @@ with tab_search:
         locations = [n for n, _ in STATE_LIST if re.search(r"\b" + re.escape(n) + r"\b", desc, re.I)]
         for m in re.finditer(r"\b([A-Za-z]{2})\b", desc):
             c = m.group(1)
-            if c.isupper() or c.istitle():
-                c = c.upper()
+            if c.isupper():
                 if c in CODE2NAME and c not in AMBIGUOUS_CODES and CODE2NAME[c] not in locations:
                     locations.append(CODE2NAME[c])
+        city_hits = []
+        for st_name, _ in STATE_LIST:
+            for m in re.finditer(r"\bin\s+([A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,2}),?\s+" + re.escape(st_name) + r"\b", desc):
+                cty = m.group(1)
+                if cty.lower() in STATE_BY_NAME or f"{cty} {st_name}".lower() in STATE_BY_NAME:
+                    continue
+                city_hits.append(f"{cty}, {st_name}")
+        for cname in CITY_TO_STATE:
+            if cname != "new york city" and re.search(r"\b" + re.escape(cname) + r"\b", desc, re.I):
+                if not any(cname in h.lower() for h in city_hits):
+                    city_hits.append(cname.title())
+        if city_hits:
+            locations = list(dict.fromkeys(city_hits))
         if re.search(r"\bnyc\b|new york city", desc, re.I):
             locations = [l for l in locations if l != "New York"] + ["New York City"]
         if re.search(r"\b(usa|u\.s\.a?\.?|united states|america)\b", desc, re.I):
@@ -1710,7 +1889,7 @@ with tab_search:
                 niches = [str(x) for x in ai.get("niches", [])][:6] or niches
                 ai_locs = [str(x) for x in ai.get("locations", []) if str(x).strip()][:20]
                 if ai_locs:
-                    locations = list(dict.fromkeys([norm_loc(x) for x in ai_locs] + locations))
+                    locations = list(dict.fromkeys([norm_loc(x) for x in ai_locs]))
                 country = str(ai.get("country", "") or "") or country
                 cc = str(ai.get("country_code", "") or "").upper() or cc
                 if int(ai.get("count", 0) or 0):
@@ -1817,7 +1996,7 @@ with tab_bulk:
         st.info(f"{len(b_recs)} websites mili.")
     if st.button("Bulk start karo", key="bulk_btn") and b_recs:
         status_b = st.empty()
-        res = run_batch(b_recs[:HARD_CAP], True, True, True, len(b_recs) <= 25, status_b)
+        res = run_batch(b_recs[:HARD_CAP], True, True, True, len(b_recs) <= 60, status_b)
         res["rows"].sort(key=lambda r: r["_score"], reverse=True)
         res["cols"] = ALL_COLS
         res["stats"] = f"{len(res['rows'])} websites ka data tayyar"
@@ -1835,5 +2014,23 @@ with tab_single:
         res["stats"] = f"{len(res['rows'])} website ka data tayyar"
         st.session_state["res"] = res
         status_s.write("Mukammal!")
+
+
+with tab_any:
+    try:
+        from universal_tab import render_universal
+    except ImportError as e:
+        st.error("universal_tab.py repo mein nahi mili: " + str(e))
+    else:
+        render_universal(fetch, DDGS, SEARCH_LOCK, get_secret)
+
+
+with tab_book:
+    try:
+        from booking_tab import render_booking
+    except ImportError as e:
+        st.error("booking_tab.py repo mein nahi mili: " + str(e))
+    else:
+        render_booking(fetch, DDGS, SEARCH_LOCK, domain_of)
 
 show_results()
